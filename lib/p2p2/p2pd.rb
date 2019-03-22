@@ -21,10 +21,9 @@ require 'socket'
 #                     3. p2 to p1: i'm alive
 #                     4. roomd to p1: p2's hole -> p2 sockaddr
 #                     5. p1 to p2: i'm alive
-#                     6. roomd to p1: i'm fin
-#                     7. p1 to roomd: i'm fin
-#                     8. p1 to p2: i'm fin
-#                     9. p2 to p1: i'm fin
+#                     6. p1 to roomd: i'm fin
+#                     7. p1 to p2: i'm fin
+#                     8. p2 to p1: i'm fin
 #
 # infos，存取sock信息，根据角色，sock => {}：
 #
@@ -88,18 +87,19 @@ module P2p2
 
               if info[ :p1s ].include?( p1_addr )
                 info[ :p1s ][ p1_addr ][ :timestamp ] = Time.new
-              else
-                filename = save_tmpfile( data[ 5..-1 ], addrinfo, @tmp_dir )
-
-                unless filename
-                  next
-                end
-
-                info[ :p1s ][ p1_addr ] = {
-                  filename: filename,
-                  timestamp: now
-                }
+                next
               end
+
+              filename = save_tmpfile( data[ 5..-1 ], addrinfo, @tmp_dir )
+
+              unless filename
+                next
+              end
+
+              info[ :p1s ][ p1_addr ] = {
+                filename: filename,
+                timestamp: now
+              }
             elsif ctl_num == 2
               # 2. p2 to roomd: tell p1, hole me -> p1 sockaddr
               p1_addr = data[ 5, 16 ]
@@ -111,8 +111,8 @@ module P2p2
 
               # send: 4. roomd to p1: p2's hole -> p2 sockaddr
               @roomd.sendmsg( [ [ 0, 4 ].pack( 'NC' ), addrinfo.to_sockaddr ].join, 0, p1_addr )
-            elsif ctl_num == 7
-              # 7. p1 to roomd: i'm fin
+            elsif ctl_num == 6
+              # 6. p1 to roomd: i'm fin
               sockaddr = addrinfo.to_sockaddr
               p1_info = @roomd_info[ :p1s ][ sockaddr ]
 

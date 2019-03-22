@@ -103,12 +103,8 @@ module P2p2
                     memories: {},
                     app: app
                   }
-                elsif ctl_num == 6
-                  # 6. roomd to p1: i'm fin
-                  sleep 5
-                  send_heartbeat_to_roomd
-                elsif ctl_num == 9
-                  # 9. p2 to p1: i'm fin
+                elsif ctl_num == 8
+                  # 8. p2 to p1: i'm fin
                   info[ :p2s ].delete( addrinfo )
                 end
 
