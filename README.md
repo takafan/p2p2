@@ -23,7 +23,7 @@
 安装：
 
 ```bash
-gem install girl
+gem install p2p2
 ```
 
 匹配服务器：
