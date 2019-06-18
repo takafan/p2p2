@@ -1,140 +1,72 @@
-require 'nio'
+require 'p2p2/head'
+require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2pd
+# P2p2::P2pd - 处于各自nat里的两端p2p。匹配服务器端。
 #
 #```
-#                p2pd                           p2pd
-#                ^                              ^
-#               ^                              ^
-#    sshd <- p2p1                            p2p2 <- ssh
-#               \                            ,
-#                `swap -> nat <-> nat <- swap
+#             p2pd                                        p2pd
+#             ^                                           ^
+#            ^                                           ^
+#  ssh --> p2 --> encode --> p2's nat --> p1's nat --> p1 --> decode --> sshd
+#
 #```
 #
-# 包结构
+# usage
+# =====
 #
-# N: 1+ pcur    -> traffic between p1 and p2
-#    0  ctl msg -> C: 1. p1 to roomd: i'm alive -> custom head
-#                     2. p2 to roomd: tell p1, hole me -> p1 sockaddr
-#                     3. p2 to p1: i'm alive
-#                     4. roomd to p1: p2's hole -> p2 sockaddr
-#                     5. p1 to p2: i'm alive
-#                     6. p1 to roomd: i'm fin
-#                     7. p1 to p2: i'm fin
-#                     8. p2 to p1: i'm fin
+# 1. Girl::P2pd.new( 5050 ).looping # @server
 #
-# infos，存取sock信息，根据角色，sock => {}：
+# 2. Girl::P1.new( '{ your.server.ip }', 5050, '127.0.0.1', 22, '周立波' ).looping # @home1
 #
-# {
-#   role: :roomd,
-#   mon: mon,
-#   p1s: {
-#     sockaddr => {
-#       filename: '6.6.6.6:12345-周立波的房间',
-#       timestamp: now
-#     }
-#   }
-# }
+# 3. Girl::P2.new( 'your.server.ip', 5050, '0.0.0.0', 2222, '周立波' ).looping # @home2
+#
+# 4. ssh -p2222 libo@localhost
 #
 module P2p2
   class P2pd
-    def initialize( roomd_port = 6060, tmp_dir = '/tmp/p2pd' )
-      selector = NIO::Selector.new
 
-      roomd = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
-      roomd.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEPORT, 1 )
-      roomd.bind( Socket.pack_sockaddr_in( roomd_port, '0.0.0.0' ) )
-
-      roomd_info = {
-        mon: selector.register( roomd, :r ),
-        p1s: {}
-      }
-
-      @tmp_dir = tmp_dir
+    ##
+    # roomd_port    匹配服务器端口，匹配服务器用于配对p1-p2
+    # roomd_dir     可在该目录下看到所有的p1
+    def initialize( roomd_port = 5050, roomd_dir = '/tmp' )
+      @roomd_port = roomd_port
+      @roomd_dir = roomd_dir
       @mutex = Mutex.new
-      @selector = selector
-      @roomd = roomd
-      @roomd_info = roomd_info
+      @roles = {} # sock => :roomd / :room
+      @pending_p1s = {} # title => room
+      @pending_p2s = {} # title => room
+      @infos = {}
+      @closings = []
+      @reads = []
 
-      @infos = {
-        roomd => roomd_info
-      }
+      new_roomd
     end
 
     def looping
-      # 删除过期的p1
+      puts 'looping'
+
       loop_expire
 
       loop do
-        @selector.select do | mon |
-          sock = mon.io
-          info = @infos[ sock ]
+        rs, _ = IO.select( @reads )
 
-          if mon.readable?
-            data, addrinfo, rflags, *controls = sock.recvmsg
-            pcur, ctl_num = data[ 0, 5 ].unpack( 'NC' )
-
-            if pcur != 0
-              next
-            end
-
-            if ctl_num == 1
-              # 1. p1 to roomd: i'm alive -> custom head
-              now = Time.new
-              p1_addr = addrinfo.to_sockaddr
-
-              if info[ :p1s ].include?( p1_addr )
-                info[ :p1s ][ p1_addr ][ :timestamp ] = Time.new
-                next
-              end
-
-              filename = save_tmpfile( data[ 5..-1 ], addrinfo, @tmp_dir )
-
-              unless filename
-                next
-              end
-
-              info[ :p1s ][ p1_addr ] = {
-                filename: filename,
-                timestamp: now
-              }
-            elsif ctl_num == 2
-              # 2. p2 to roomd: tell p1, hole me -> p1 sockaddr
-              p1_addr = data[ 5, 16 ]
-
-              unless @room_info[ :p1s ].include?( p1_addr )
-                puts 'p1 not found'
-                next
-              end
-
-              # send: 4. roomd to p1: p2's hole -> p2 sockaddr
-              @roomd.sendmsg( [ [ 0, 4 ].pack( 'NC' ), addrinfo.to_sockaddr ].join, 0, p1_addr )
-            elsif ctl_num == 6
-              # 6. p1 to roomd: i'm fin
-              sockaddr = addrinfo.to_sockaddr
-              p1_info = @roomd_info[ :p1s ][ sockaddr ]
-
-              unless p1_info
-                puts 'p1 not found'
-                next
-              end
-
-              del_p1( sockaddr, p1_info )
-            end
+        rs.each do | sock |
+          case @roles[ sock ]
+          when :roomd
+            read_roomd( sock )
+          when :room
+            read_room( sock )
           end
         end
       end
+    rescue Interrupt => e
+      puts e.class
+      quit!
     end
 
     def quit!
-      @mutex.synchronize do
-        @roomd_info[ :p1s ].each do | p1_sockaddr, p1_info |
-          del_tmpfile( p1_info[ :filename ] )
-        end
-      end
-
       exit
     end
 
@@ -143,48 +75,148 @@ module P2p2
     def loop_expire
       Thread.new do
         loop do
-          now = Time.new
+          sleep 900
 
-          @mutex.synchronize do
-            @roomd_info[ :p1s ].select{ | _, p1_info | now - p1_info[ :timestamp ] > 7200 }.each do | p1_sockaddr, p1_info |
-              del_p1( p1_sockaddr, p1_info )
+          if @infos.any?
+            @mutex.synchronize do
+              now = Time.new
+
+              @infos.select{ | _, info | info[ :last_coming_at ] && ( now - info[ :last_coming_at ] > 1800 ) }.each do | room, _ |
+                close_sock( room )
+              end
             end
           end
-
-          sleep 3600
         end
       end
     end
 
-    def save_tmpfile( data, addrinfo, tmp_dir )
-      filename = addrinfo.ip_unpack.join( ':' )
-
-      unless data.empty?
-        filename = [ filename, data ].join( '-' )
-      end
-
-      path = File.join( tmp_dir, filename )
-
+    def read_roomd( sock )
       begin
-        File.open( path, 'w' )
-      rescue Errno::ENOENT, ArgumentError => e
-        puts "save p1 tmpfile #{ path.inspect } #{ e.class }"
-        filename = nil
+        room, addr = sock.accept_nonblock
+      rescue IO::WaitReadable, Errno::EINTR
+        return
       end
 
-      filename
+      puts 'debug accept a room'
+      @roles[ room ] = :room
+      @infos[ room ] = {
+        title: nil,
+        last_coming_at: nil,
+        sockaddr: addr.to_sockaddr
+      }
+      @reads << room
     end
 
-    def del_p1( p1_sockaddr, p1_info )
-      del_tmpfile( p1_info[ :filename ] )
-      @roomd_info[ :p1s ].delete( p1_sockaddr )
+    def read_room( sock )
+      begin
+        data = sock.read_nonblock( PACK_SIZE )
+      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
+        return
+      rescue Exception => e
+        close_sock( sock )
+        return
+      end
+
+      info = @infos[ sock ]
+      info[ :last_coming_at ] = Time.new
+
+      until data.empty?
+        ctl_num = data[ 0 ].unpack( 'C' ).first
+
+        case ctl_num
+        when HEARTBEAT
+          data = data[ 1..-1 ]
+        when SET_TITLE
+          len = data[ 1, 2 ].unpack( 'n' ).first
+
+          if len > 255
+            puts "#{ ctl_num } title too long"
+            close_sock( sock )
+            return
+          end
+
+          title = data[ 3, len ]
+
+          if @pending_p2s.include?( title )
+            p2 = @pending_p2s[ title ]
+            p2_info = @infos[ p2 ]
+            sock.write( p2_info[ :sockaddr ] )
+            p2.write( info[ :sockaddr ] )
+          elsif @pending_p1s.include?( title )
+            puts "#{ ctl_num } #{ title.inspect } already exist"
+            close_sock( sock )
+            return
+          else
+            @pending_p1s[ title ] = sock
+            info[ :title ] = title
+
+            begin
+              File.open( File.join( @roomd_dir, title ), 'w' )
+            rescue Errno::ENOENT, ArgumentError => e
+              puts "open tmp path #{ e.class }"
+              close_sock( sock )
+              return
+            end
+          end
+
+          data = data[ ( 3 + len )..-1 ]
+        when PAIRING
+          len = data[ 1, 2 ].unpack( 'n' ).first
+
+          if len > 255
+            puts "#{ ctl_num } title too long"
+            close_sock( sock )
+            return
+          end
+
+          title = data[ 3, len ]
+
+          if @pending_p1s.include?( title )
+            p1 = @pending_p1s[ title ]
+            p1_info = @infos[ p1 ]
+            sock.write( p1_info[ :sockaddr ] )
+            p1.write( info[ :sockaddr ] )
+          elsif @pending_p2s.include?( title )
+            puts "#{ ctl_num } pending p2 #{ title.inspect } already exist"
+            close_sock( sock )
+            return
+          else
+            @pending_p2s[ title ] = sock
+            info[ :title ] = title
+          end
+
+          data = data[ ( 3 + len )..-1 ]
+        end
+      end
     end
 
-    def del_tmpfile( filename )
-      begin
-        File.delete( File.join( @tmp_dir, filename ) )
-      rescue Errno::ENOENT
+    def close_sock( sock )
+      sock.close
+      @roles.delete( sock )
+      @reads.delete( sock )
+      info = @infos.delete( sock )
+
+      if info && info[ :title ]
+        @pending_p1s.delete( info[ :title ] )
+        @pending_p2s.delete( info[ :title ] )
+
+        begin
+          File.delete( File.join( @roomd_dir, info[ :title ] ) )
+        rescue Errno::ENOENT
+        end
       end
+
+      info
+    end
+
+    def new_roomd
+      roomd = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
+      roomd.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
+      roomd.bind( Socket.pack_sockaddr_in( @roomd_port, '0.0.0.0' ) )
+      roomd.listen( 511 )
+
+      @roles[ roomd ] = :roomd
+      @reads << roomd
     end
   end
 end
