@@ -235,11 +235,6 @@ module P2p2
       if @closings.include?( sock )
         close_sock( sock )
         @p2 = nil
-
-        if @app && !@app.closed?
-          add_closing( @app )
-        end
-
         need_renew = @closings.delete( sock )
 
         if need_renew
