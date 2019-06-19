@@ -107,12 +107,6 @@ module P2p2
       end
 
       @is_renew = false
-
-      if @p1
-        puts 'p1 already exist, ignore'
-        return
-      end
-
       info = @infos[ sock ]
       info[ :p2_sockaddr ] = data
       new_p1
