@@ -43,23 +43,25 @@ module P2p2
       loop do
         rs, ws = IO.select( @reads, @writes )
 
-        rs.each do | sock |
-          case @roles[ sock ]
-          when :room
-            read_room( sock )
-          when :p1
-            read_p1( sock )
-          when :app
-            read_app( sock )
+        @mutex.synchronize do
+          rs.each do | sock |
+            case @roles[ sock ]
+            when :room
+              read_room( sock )
+            when :p1
+              read_p1( sock )
+            when :app
+              read_app( sock )
+            end
           end
-        end
 
-        ws.each do | sock |
-          case @roles[ sock ]
-          when :p1
-            write_p1( sock )
-          when :app
-            write_app( sock )
+          ws.each do | sock |
+            case @roles[ sock ]
+            when :p1
+              write_p1( sock )
+            when :app
+              write_app( sock )
+            end
           end
         end
       end

@@ -41,29 +41,30 @@ module P2p2
       loop do
         rs, ws = IO.select( @reads, @writes )
 
-        rs.each do | sock |
-          case @roles[ sock ]
-          when :appd
-            read_appd( sock )
-          when :app
-            read_app( sock )
-          when :room
-            read_room( sock )
-          when :p2
-            read_p2( sock )
+        @mutex.synchronize do
+          rs.each do | sock |
+            case @roles[ sock ]
+            when :appd
+              read_appd( sock )
+            when :app
+              read_app( sock )
+            when :room
+              read_room( sock )
+            when :p2
+              read_p2( sock )
+            end
           end
-        end
 
-        ws.each do | sock |
-          case @roles[ sock ]
-          when :p2
-            write_p2( sock )
-          when :app
-            write_app( sock )
+          ws.each do | sock |
+            case @roles[ sock ]
+            when :p2
+              write_p2( sock )
+            when :app
+              write_app( sock )
+            end
           end
         end
       end
-
     rescue Interrupt => e
       puts e.class
       quit!

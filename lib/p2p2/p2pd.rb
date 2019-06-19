@@ -6,10 +6,10 @@ require 'socket'
 # P2p2::P2pd - 处于各自nat里的两端p2p。匹配服务器端。
 #
 #```
-#             p2pd                                        p2pd
-#             ^                                           ^
-#            ^                                           ^
-#  ssh --> p2 --> encode --> p2's nat --> p1's nat --> p1 --> decode --> sshd
+#              p2pd                              p2pd
+#             ^                                 ^
+#            ^                                 ^
+#  ssh --> p2 --> encode --> nat --> nat --> p1 --> decode --> sshd
 #
 #```
 #
@@ -18,7 +18,7 @@ require 'socket'
 #
 # 1. Girl::P2pd.new( 5050 ).looping # @server
 #
-# 2. Girl::P1.new( '{ your.server.ip }', 5050, '127.0.0.1', 22, '周立波' ).looping # @home1
+# 2. Girl::P1.new( 'your.server.ip', 5050, '127.0.0.1', 22, '周立波' ).looping # @home1
 #
 # 3. Girl::P2.new( 'your.server.ip', 5050, '0.0.0.0', 2222, '周立波' ).looping # @home2
 #
@@ -28,7 +28,7 @@ module P2p2
   class P2pd
 
     ##
-    # roomd_port    匹配服务器端口，匹配服务器用于配对p1-p2
+    # roomd_port    配对服务器端口
     # roomd_dir     可在该目录下看到所有的p1
     def initialize( roomd_port = 5050, roomd_dir = '/tmp' )
       @roomd_port = roomd_port
@@ -38,7 +38,6 @@ module P2p2
       @pending_p1s = {} # title => room
       @pending_p2s = {} # title => room
       @infos = {}
-      @closings = []
       @reads = []
 
       new_roomd
@@ -52,12 +51,14 @@ module P2p2
       loop do
         rs, _ = IO.select( @reads )
 
-        rs.each do | sock |
-          case @roles[ sock ]
-          when :roomd
-            read_roomd( sock )
-          when :room
-            read_room( sock )
+        @mutex.synchronize do
+          rs.each do | sock |
+            case @roles[ sock ]
+            when :roomd
+              read_roomd( sock )
+            when :room
+              read_room( sock )
+            end
           end
         end
       end
@@ -97,7 +98,6 @@ module P2p2
         return
       end
 
-      puts 'debug accept a room'
       @roles[ room ] = :room
       @infos[ room ] = {
         title: nil,
@@ -130,7 +130,7 @@ module P2p2
           len = data[ 1, 2 ].unpack( 'n' ).first
 
           if len > 255
-            puts "#{ ctl_num } title too long"
+            puts "title too long"
             close_sock( sock )
             return
           end
@@ -143,7 +143,7 @@ module P2p2
             sock.write( p2_info[ :sockaddr ] )
             p2.write( info[ :sockaddr ] )
           elsif @pending_p1s.include?( title )
-            puts "#{ ctl_num } #{ title.inspect } already exist"
+            puts "pending p1 #{ title.inspect } already exist"
             close_sock( sock )
             return
           else
@@ -153,7 +153,7 @@ module P2p2
             begin
               File.open( File.join( @roomd_dir, title ), 'w' )
             rescue Errno::ENOENT, ArgumentError => e
-              puts "open tmp path #{ e.class }"
+              puts "open title path #{ e.class }"
               close_sock( sock )
               return
             end
@@ -164,7 +164,7 @@ module P2p2
           len = data[ 1, 2 ].unpack( 'n' ).first
 
           if len > 255
-            puts "#{ ctl_num } title too long"
+            puts 'pairing title too long'
             close_sock( sock )
             return
           end
@@ -177,7 +177,7 @@ module P2p2
             sock.write( p1_info[ :sockaddr ] )
             p1.write( info[ :sockaddr ] )
           elsif @pending_p2s.include?( title )
-            puts "#{ ctl_num } pending p2 #{ title.inspect } already exist"
+            puts "pending p2 #{ title.inspect } already exist"
             close_sock( sock )
             return
           else
