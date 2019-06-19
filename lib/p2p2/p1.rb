@@ -129,34 +129,7 @@ module P2p2
         return
       end
 
-      unless @app
-        @room_info[ :rep2p ] = 0
-        app = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
-        app.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
-
-        begin
-          app.connect_nonblock( @appd_sockaddr )
-        rescue IO::WaitWritable, Errno::EINTR
-        end
-
-        app_info = {
-          wbuff: '',
-          cache: '',
-          filename: [ Process.pid, app.object_id ].join( '-' ),
-          chunk_dir: @app_chunk_dir,
-          chunks: [],
-          chunk_seed: 0,
-          p1: sock,
-          need_encode: true
-        }
-
-        @app = app
-        @app_info = app_info
-        @roles[ app ] = :app
-        @infos[ app ] = app_info
-        @reads << app
-      end
-
+      @room_info[ :rep2p ] = 0
       info = @infos[ sock ]
 
       if info[ :need_decode ]
@@ -408,6 +381,30 @@ module P2p2
       @roles[ p1 ] = :p1
       @infos[ p1 ] = p1_info
       @reads << p1
+
+      app = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
+      app.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
+
+      begin
+        app.connect_nonblock( @appd_sockaddr )
+      rescue IO::WaitWritable, Errno::EINTR
+      end
+
+      app_info = {
+        wbuff: '',
+        cache: '',
+        filename: [ Process.pid, app.object_id ].join( '-' ),
+        chunk_dir: @app_chunk_dir,
+        chunks: [],
+        chunk_seed: 0,
+        need_encode: true
+      }
+
+      @app = app
+      @app_info = app_info
+      @roles[ app ] = :app
+      @infos[ app ] = app_info
+      @reads << app
     end
   end
 end
