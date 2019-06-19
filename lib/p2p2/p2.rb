@@ -38,6 +38,8 @@ module P2p2
     def looping
       puts 'looping'
 
+      loop_heartbeat
+
       loop do
         rs, ws = IO.select( @reads, @writes )
 
@@ -57,6 +59,8 @@ module P2p2
 
           ws.each do | sock |
             case @roles[ sock ]
+            when :room
+              write_room( sock )
             when :p2
               write_p2( sock )
             when :app
@@ -152,17 +156,14 @@ module P2p2
         data = sock.read_nonblock( PACK_SIZE )
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable => e
         return
-      rescue EOFError, Errno::ECONNRESET => e
+      rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
         if @is_renew
           raise e
         end
 
-        close_sock( @room )
-        sleep 5
-        new_room
-        @is_renew = true
+        add_closing( sock )
         return
       end
 
@@ -205,6 +206,29 @@ module P2p2
       end
 
       add_write( @app, data, NEED_CHUNK )
+    end
+
+    def write_room( sock )
+      if @closings.include?( sock )
+        close_sock( sock )
+        sleep 5
+        new_room
+        @is_renew = true
+        @closings.delete( sock )
+
+        return
+      end
+
+      info = @infos[ sock ]
+      data = info[ :wbuff ]
+
+      if data.empty?
+        @writes.delete( sock )
+        return
+      end
+
+      sock.write( data )
+      info[ :wbuff ].clear
     end
 
     def write_p2( sock )
@@ -371,7 +395,9 @@ module P2p2
       rescue IO::WaitWritable, Errno::EINTR
       end
 
+      bytes = @title.unpack( "C*" ).map{ | c | c.chr }.join
       room_info = {
+        wbuff: [ [ PAIRING, bytes.size ].pack( 'Cn' ), bytes ].join,
         p1_sockaddr: nil,
         rep2p: 0
       }
@@ -380,9 +406,7 @@ module P2p2
       @roles[ room ] = :room
       @infos[ room ] = room_info
       @reads << room
-
-      bytes = @title.unpack( "C*" ).map{ | c | c.chr }.join
-      @room.write( [ [ PAIRING, bytes.size ].pack( 'Cn' ), bytes ].join )
+      @writes << room
     end
 
     def new_p2
