@@ -173,10 +173,6 @@ module P2p2
             p2_info = @infos[ p2 ]
             add_write( sock, p2_info[ :sockaddr ] )
             add_write( p2, info[ :sockaddr ] )
-          elsif @pending_p1s.include?( title )
-            puts "pending p1 #{ title.inspect } already exist"
-            add_closing( sock )
-            return
           else
             @pending_p1s[ title ] = sock
             info[ :title ] = title
@@ -207,10 +203,6 @@ module P2p2
             p1_info = @infos[ p1 ]
             add_write( sock, p1_info[ :sockaddr ] )
             add_write( p1, info[ :sockaddr ] )
-          elsif @pending_p2s.include?( title )
-            puts "pending p2 #{ title.inspect } already exist"
-            add_closing( sock )
-            return
           else
             @pending_p2s[ title ] = sock
             info[ :title ] = title

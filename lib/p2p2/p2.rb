@@ -169,6 +169,7 @@ module P2p2
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Errno::ECONNREFUSED => e
+        puts "read p2 #{ e.class } #{ Time.new }"
         if @room_info[ :rep2p ] >= REP2P_LIMIT
           raise e
         end
@@ -178,11 +179,18 @@ module P2p2
         @room_info[ :rep2p ] += 1
         return
       rescue Exception => e
+        puts "read p2 #{ e.class } #{ Time.new }"
         add_closing( sock )
         return
       end
 
       @room_info[ :rep2p ] = 0
+
+      unless @app
+        add_closing( sock )
+        return
+      end
+
       info = @infos[ sock ]
 
       if info[ :need_decode ]
@@ -198,6 +206,7 @@ module P2p2
     def write_room( sock )
       if @renewings.include?( sock )
         close_sock( sock )
+        @p2 = nil
         new_room
         return
       end
@@ -215,13 +224,17 @@ module P2p2
     end
 
     def write_p2( sock )
+      if sock.closed?
+        return
+      end
+
       if @closings.include?( sock )
-        close_p2
+        close_sock( sock )
         return
       end
 
       if @renewings.include?( sock )
-        close_p2
+        close_sock( sock )
         new_p2
         return
       end
@@ -248,13 +261,12 @@ module P2p2
     end
 
     def write_app( sock )
+      if sock.closed?
+        return
+      end
+
       if @closings.include?( sock )
         close_sock( sock )
-
-        unless @p2.closed?
-          add_closing( @p2 )
-        end
-
         return
       end
 
@@ -302,7 +314,7 @@ module P2p2
     def add_closing( sock )
       unless @closings.include?( sock )
         @reads.delete( sock )
-        @closings <<  sock
+        @closings << sock
       end
 
       add_write( sock )
@@ -311,7 +323,7 @@ module P2p2
     def add_renewing( sock )
       unless @renewings.include?( sock )
         @reads.delete( sock )
-        @renewings <<  sock
+        @renewings << sock
       end
 
       add_write( sock )
@@ -356,10 +368,6 @@ module P2p2
       end
 
       info
-    end
-
-    def close_p2
-      close_sock( @p2 )
     end
 
     def new_appd
@@ -410,6 +418,7 @@ module P2p2
       rescue Exception => e
         puts "connect p1 #{ e.class } #{ Time.new }"
         p2.close
+        add_renewing( @room )
         return
       end
 

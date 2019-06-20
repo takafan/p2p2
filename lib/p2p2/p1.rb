@@ -152,6 +152,12 @@ module P2p2
       end
 
       @room_info[ :rep2p ] = 0
+
+      unless @app
+        add_closing( sock )
+        return
+      end
+
       info = @infos[ sock ]
 
       if info[ :need_decode ]
@@ -174,6 +180,11 @@ module P2p2
         return
       end
 
+      unless @p1
+        add_closing( sock )
+        return
+      end
+
       info = @infos[ sock ]
 
       if info[ :need_encode ]
@@ -188,6 +199,8 @@ module P2p2
     def write_room( sock )
       if @renewings.include?( sock )
         close_sock( sock )
+        @p1 = nil
+        @app = nil
         new_room
         return
       end
@@ -205,13 +218,17 @@ module P2p2
     end
 
     def write_p1( sock )
+      if sock.closed?
+        return
+      end
+
       if @closings.include?( sock )
-        close_p1
+        close_sock( sock )
         return
       end
 
       if @renewings.include?( sock )
-        close_p1
+        close_sock( sock )
         new_p1
         return
       end
@@ -238,13 +255,12 @@ module P2p2
     end
 
     def write_app( sock )
+      if sock.closed?
+        return
+      end
+
       if @closings.include?( sock )
         close_sock( sock )
-
-        unless @p1.closed?
-          add_closing( @p1 )
-        end
-
         return
       end
 
@@ -292,7 +308,7 @@ module P2p2
     def add_closing( sock )
       unless @closings.include?( sock )
         @reads.delete( sock )
-        @closings <<  sock
+        @closings << sock
       end
 
       add_write( sock )
@@ -301,7 +317,7 @@ module P2p2
     def add_renewing( sock )
       unless @renewings.include?( sock )
         @reads.delete( sock )
-        @renewings <<  sock
+        @renewings << sock
       end
 
       add_write( sock )
@@ -348,14 +364,6 @@ module P2p2
       info
     end
 
-    def close_p1
-      close_sock( @p1 )
-
-      unless @app.closed?
-        add_closing( @app )
-      end
-    end
-
     def new_room
       room = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
       room.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
@@ -393,6 +401,7 @@ module P2p2
       rescue Exception => e
         puts "connect p2 #{ e.class } #{ Time.new }"
         p1.close
+        add_renewing( @room )
         return
       end
 
