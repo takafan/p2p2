@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
   spec.email         = ["qqtakafan@gmail.com"]
 
   spec.summary       = %q{p2p}
-  spec.description   = %q{p2p even both sides under its nat.}
+  spec.description   = %q{处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。}
   spec.homepage      = "https://github.com/takafan/p2p2"
   spec.license       = "MIT"
 

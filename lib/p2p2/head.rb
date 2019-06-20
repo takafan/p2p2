@@ -6,5 +6,6 @@ module P2p2
   SET_TITLE = 2
   PAIRING = 3
   NEED_CHUNK = true
-  NEED_RENEW = true
+  CTL_CLOSE_ROOM = [ 1 ].pack( 'C' )
+  CTL_RENEW_ROOM = [ 2 ].pack( 'C' )
 end

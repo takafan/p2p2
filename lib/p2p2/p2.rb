@@ -4,7 +4,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2 - 处于各自nat里的两端p2p。p2端。
+# P2p2::P2 - 处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。p2端。
 #
 module P2p2
   class P2
@@ -25,20 +25,19 @@ module P2p2
       @p2_chunk_dir = p2_chunk_dir
       @hex = P2p2::Hex.new
       @mutex = Mutex.new
-      @roles = {}  # sock => :appd / :app / :room / :p2
-      @infos = {}
-      @closings = {} # sock => need_renew
       @reads = []
       @writes = []
-      @is_renew = false
+      @closings = []
+      @renewings = []
+      @roles = {}  # sock => :appd / :app / :room / :p2
+      @infos = {}
+      @retries = 0
 
       new_appd
     end
 
     def looping
       puts 'looping'
-
-      loop_heartbeat
 
       loop do
         rs, ws = IO.select( @reads, @writes )
@@ -80,20 +79,6 @@ module P2p2
 
     private
 
-    def loop_heartbeat
-      Thread.new do
-        loop do
-          sleep 59
-
-          @mutex.synchronize do
-            if @room
-              @room.write( [ HEARTBEAT ].pack( 'C' ) )
-            end
-          end
-        end
-      end
-    end
-
     def read_appd( sock )
       begin
         app, addr = sock.accept_nonblock
@@ -129,7 +114,7 @@ module P2p2
     def read_app( sock )
       begin
         data = sock.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable => e
+      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Exception => e
         add_closing( sock )
@@ -144,36 +129,35 @@ module P2p2
         info[ :need_encode ] = false
       end
 
-      if @p2
-        add_write( @p2, data, NEED_CHUNK )
-      else
+      if @p2.nil?
         info[ :rbuff ] << data
+      elsif @p2.closed?
+        info[ :rbuff ] << data
+        add_renewing( @room )
+      else
+        add_write( @p2, data, NEED_CHUNK )
       end
     end
 
     def read_room( sock )
       begin
         data = sock.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable => e
+      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @is_renew
+        if @retries >= 2
           raise e
         end
 
-        add_closing( sock )
+        sleep 5
+        add_renewing( sock )
+        @retries += 1
         return
       end
 
-      @is_renew = false
-
-      if @p2
-        puts 'p2 already exist, ignore'
-        return
-      end
-
+      @retries = 0
       info = @infos[ sock ]
       info[ :p1_sockaddr ] = data
       new_p2
@@ -182,20 +166,23 @@ module P2p2
     def read_p2( sock )
       begin
         data = sock.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable => e
+      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Errno::ECONNREFUSED => e
         if @room_info[ :rep2p ] >= REP2P_LIMIT
           raise e
         end
 
-        add_closing( sock, NEED_RENEW )
+        sleep 1
+        add_renewing( sock )
+        @room_info[ :rep2p ] += 1
         return
       rescue Exception => e
         add_closing( sock )
         return
       end
 
+      @room_info[ :rep2p ] = 0
       info = @infos[ sock ]
 
       if info[ :need_decode ]
@@ -209,13 +196,9 @@ module P2p2
     end
 
     def write_room( sock )
-      if @closings.include?( sock )
+      if @renewings.include?( sock )
         close_sock( sock )
-        sleep 5
         new_room
-        @is_renew = true
-        @closings.delete( sock )
-
         return
       end
 
@@ -233,16 +216,13 @@ module P2p2
 
     def write_p2( sock )
       if @closings.include?( sock )
-        close_sock( sock )
-        @p2 = nil
-        need_renew = @closings.delete( sock )
+        close_p2
+        return
+      end
 
-        if need_renew
-          sleep 1
-          new_p2
-          @room_info[ :rep2p ] += 1
-        end
-
+      if @renewings.include?( sock )
+        close_p2
+        new_p2
         return
       end
 
@@ -270,13 +250,11 @@ module P2p2
     def write_app( sock )
       if @closings.include?( sock )
         close_sock( sock )
-        @app = nil
 
-        if @p2 && !@p2.closed?
+        unless @p2.closed?
           add_closing( @p2 )
         end
 
-        @closings.delete( sock )
         return
       end
 
@@ -321,9 +299,19 @@ module P2p2
       [ data, from ]
     end
 
-    def add_closing( sock, need_renew = false )
+    def add_closing( sock )
       unless @closings.include?( sock )
-        @closings[ sock ] = need_renew
+        @reads.delete( sock )
+        @closings <<  sock
+      end
+
+      add_write( sock )
+    end
+
+    def add_renewing( sock )
+      unless @renewings.include?( sock )
+        @reads.delete( sock )
+        @renewings <<  sock
       end
 
       add_write( sock )
@@ -351,6 +339,8 @@ module P2p2
 
     def close_sock( sock )
       sock.close
+      @closings.delete( sock )
+      @renewings.delete( sock )
       @roles.delete( sock )
       @reads.delete( sock )
       @writes.delete( sock )
@@ -366,6 +356,10 @@ module P2p2
       end
 
       info
+    end
+
+    def close_p2
+      close_sock( @p2 )
     end
 
     def new_appd

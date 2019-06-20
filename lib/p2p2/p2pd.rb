@@ -3,7 +3,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2pd - 处于各自nat里的两端p2p。匹配服务器端。
+# P2p2::P2pd - 处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。配对服务器端。
 #
 #```
 #              p2pd                              p2pd
@@ -34,11 +34,19 @@ module P2p2
       @roomd_port = roomd_port
       @roomd_dir = roomd_dir
       @mutex = Mutex.new
-      @roles = {} # sock => :roomd / :room
+      @reads = []
+      @writes = []
+      @closings = []
+      @rooms = {} # object_id => room
       @pending_p1s = {} # title => room
       @pending_p2s = {} # title => room
+      @roles = {} # sock => :roomd / :room
       @infos = {}
-      @reads = []
+
+      ctlr, ctlw = IO.pipe
+      @ctlw = ctlw
+      @reads << ctlr
+      @roles[ ctlr ] = :ctlr
 
       new_roomd
     end
@@ -49,15 +57,24 @@ module P2p2
       loop_expire
 
       loop do
-        rs, _ = IO.select( @reads )
+        rs, ws = IO.select( @reads, @writes )
 
         @mutex.synchronize do
           rs.each do | sock |
             case @roles[ sock ]
+            when :ctlr
+              read_ctlr( sock )
             when :roomd
               read_roomd( sock )
             when :room
               read_room( sock )
+            end
+          end
+
+          ws.each do | sock |
+            case @roles[ sock ]
+            when :room
+              write_room( sock )
             end
           end
         end
@@ -82,11 +99,23 @@ module P2p2
             @mutex.synchronize do
               now = Time.new
 
-              @infos.select{ | _, info | info[ :last_coming_at ] && ( now - info[ :last_coming_at ] > 1800 ) }.each do | room, _ |
-                close_sock( room )
+              @infos.select{ | _, info | now - info[ :updated_at ] > 1800 }.each do | room, _ |
+                @ctlw.write( [ CTL_CLOSE_ROOM, [ room.object_id ].pack( 'N' ) ].join )
               end
             end
           end
+        end
+      end
+    end
+
+    def read_ctlr( sock )
+      case sock.read( 1 )
+      when CTL_CLOSE_ROOM
+        room_id = sock.read( 4 ).unpack( 'N' ).first
+        room = @rooms[ room_id ]
+
+        if room
+          add_closing( @rooms[ room_id ] )
         end
       end
     end
@@ -98,10 +127,12 @@ module P2p2
         return
       end
 
+      @rooms[ room.object_id ] = room
       @roles[ room ] = :room
       @infos[ room ] = {
         title: nil,
-        last_coming_at: nil,
+        wbuff: '',
+        updated_at: Time.new,
         sockaddr: addr.to_sockaddr
       }
       @reads << room
@@ -113,12 +144,12 @@ module P2p2
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Exception => e
-        close_sock( sock )
+        add_closing( sock )
         return
       end
 
       info = @infos[ sock ]
-      info[ :last_coming_at ] = Time.new
+      info[ :updated_at ] = Time.new
 
       until data.empty?
         ctl_num = data[ 0 ].unpack( 'C' ).first
@@ -131,7 +162,7 @@ module P2p2
 
           if len > 255
             puts "title too long"
-            close_sock( sock )
+            add_closing( sock )
             return
           end
 
@@ -140,11 +171,11 @@ module P2p2
           if @pending_p2s.include?( title )
             p2 = @pending_p2s[ title ]
             p2_info = @infos[ p2 ]
-            sock.write( p2_info[ :sockaddr ] )
-            p2.write( info[ :sockaddr ] )
+            add_write( sock, p2_info[ :sockaddr ] )
+            add_write( p2, info[ :sockaddr ] )
           elsif @pending_p1s.include?( title )
             puts "pending p1 #{ title.inspect } already exist"
-            close_sock( sock )
+            add_closing( sock )
             return
           else
             @pending_p1s[ title ] = sock
@@ -154,7 +185,7 @@ module P2p2
               File.open( File.join( @roomd_dir, title ), 'w' )
             rescue Errno::ENOENT, ArgumentError => e
               puts "open title path #{ e.class }"
-              close_sock( sock )
+              add_closing( sock )
               return
             end
           end
@@ -165,7 +196,7 @@ module P2p2
 
           if len > 255
             puts 'pairing title too long'
-            close_sock( sock )
+            add_closing( sock )
             return
           end
 
@@ -174,11 +205,11 @@ module P2p2
           if @pending_p1s.include?( title )
             p1 = @pending_p1s[ title ]
             p1_info = @infos[ p1 ]
-            sock.write( p1_info[ :sockaddr ] )
-            p1.write( info[ :sockaddr ] )
+            add_write( sock, p1_info[ :sockaddr ] )
+            add_write( p1, info[ :sockaddr ] )
           elsif @pending_p2s.include?( title )
             puts "pending p2 #{ title.inspect } already exist"
-            close_sock( sock )
+            add_closing( sock )
             return
           else
             @pending_p2s[ title ] = sock
@@ -190,10 +221,51 @@ module P2p2
       end
     end
 
+    def write_room( sock )
+      if @closings.include?( sock )
+        close_sock( sock )
+        return
+      end
+
+      info = @infos[ sock ]
+      data = info[ :wbuff ]
+
+      if data.empty?
+        @writes.delete( sock )
+        return
+      end
+
+      sock.write( data )
+      info[ :wbuff ].clear
+    end
+
+    def add_closing( sock )
+      unless @closings.include?( sock )
+        @reads.delete( sock )
+        @closings <<  sock
+      end
+
+      add_write( sock )
+    end
+
+    def add_write( sock, data = nil )
+      if data
+        info = @infos[ sock ]
+        info[ :wbuff ] << data
+      end
+
+      unless @writes.include?( sock )
+        @writes << sock
+      end
+    end
+
     def close_sock( sock )
       sock.close
-      @roles.delete( sock )
       @reads.delete( sock )
+      @writes.delete( sock )
+      @closings.delete( sock )
+      @rooms.delete( sock.object_id )
+      @roles.delete( sock )
       info = @infos.delete( sock )
 
       if info && info[ :title ]
