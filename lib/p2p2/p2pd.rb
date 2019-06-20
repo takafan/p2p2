@@ -37,7 +37,7 @@ module P2p2
       @reads = []
       @writes = []
       @closings = []
-      @rooms = {} # object_id => room
+      @socks = {} # object_id => sock
       @pending_p1s = {} # title => room
       @pending_p2s = {} # title => room
       @roles = {} # sock => :roomd / :room
@@ -45,8 +45,8 @@ module P2p2
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
-      @reads << ctlr
       @roles[ ctlr ] = :ctlr
+      @reads << ctlr
 
       new_roomd
     end
@@ -112,10 +112,10 @@ module P2p2
       case sock.read( 1 )
       when CTL_CLOSE_ROOM
         room_id = sock.read( 4 ).unpack( 'N' ).first
-        room = @rooms[ room_id ]
+        room = @socks[ room_id ]
 
         if room
-          add_closing( @rooms[ room_id ] )
+          add_closing( room )
         end
       end
     end
@@ -127,7 +127,7 @@ module P2p2
         return
       end
 
-      @rooms[ room.object_id ] = room
+      @socks[ room.object_id ] = room
       @roles[ room ] = :room
       @infos[ room ] = {
         title: nil,
@@ -264,7 +264,7 @@ module P2p2
       @reads.delete( sock )
       @writes.delete( sock )
       @closings.delete( sock )
-      @rooms.delete( sock.object_id )
+      @socks.delete( sock.object_id )
       @roles.delete( sock )
       info = @infos.delete( sock )
 

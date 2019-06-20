@@ -10,8 +10,8 @@ module P2p2
   class P1
 
     ##
-    # roomd_host    匹配服务器ip
-    # roomd_port    匹配服务器端口
+    # roomd_host    配对服务器ip
+    # roomd_port    配对服务器端口
     # appd_host     任意的一个应用的ip
     # appd_port     应用端口
     # title         约定的房间名
@@ -35,8 +35,8 @@ module P2p2
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
-      @reads << ctlr
       @roles[ ctlr ] = :ctlr
+      @reads << ctlr
 
       new_room
     end
@@ -329,11 +329,11 @@ module P2p2
 
     def close_sock( sock )
       sock.close
+      @reads.delete( sock )
+      @writes.delete( sock )
       @closings.delete( sock )
       @renewings.delete( sock )
       @roles.delete( sock )
-      @reads.delete( sock )
-      @writes.delete( sock )
       info = @infos.delete( sock )
 
       if info && info[ :chunks ]
