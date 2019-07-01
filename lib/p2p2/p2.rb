@@ -394,7 +394,7 @@ module P2p2
 
       bytes = @title.unpack( "C*" ).map{ | c | c.chr }.join
       room_info = {
-        wbuff: [ [ PAIRING, bytes.size ].pack( 'Cn' ), bytes ].join,
+        wbuff: [ [ PAIRING ].pack( 'C' ), bytes ].join,
         p1_sockaddr: nil,
         rep2p: 0
       }

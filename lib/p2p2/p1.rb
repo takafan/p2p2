@@ -28,7 +28,6 @@ module P2p2
       @reads = []
       @writes = []
       @closings = []
-      @renewings = []
       @roles = {}  # sock => :ctlr / :room / :p1 / :app
       @infos = {}
       @retries = 0
@@ -44,7 +43,7 @@ module P2p2
     def looping
       puts 'looping'
 
-      loop_renew_room
+      loop_expire
 
       loop do
         rs, ws = IO.select( @reads, @writes )
@@ -86,14 +85,14 @@ module P2p2
 
     private
 
-    def loop_renew_room
+    def loop_expire
       Thread.new do
         loop do
           sleep 60
 
           if Time.new - @room_info[ :updated_at ] > 600
             @mutex.synchronize do
-              @ctlw.write( CTL_RENEW_ROOM )
+              @ctlw.write( CTL_CLOSE_ROOM )
             end
           end
         end
@@ -102,8 +101,8 @@ module P2p2
 
     def read_ctlr( sock )
       case sock.read( 1 )
-      when CTL_RENEW_ROOM
-        add_renewing( @room )
+      when CTL_CLOSE_ROOM
+        add_closing( @room )
       end
     end
 
@@ -120,7 +119,7 @@ module P2p2
         end
 
         sleep 5
-        add_renewing( sock )
+        add_closing( sock )
         @retries += 1
         return
       end
@@ -133,6 +132,8 @@ module P2p2
     end
 
     def read_p1( sock )
+      info = @infos[ sock ]
+
       begin
         data = sock.read_nonblock( PACK_SIZE )
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
@@ -143,7 +144,8 @@ module P2p2
         end
 
         sleep 1
-        add_renewing( sock )
+        add_closing( sock )
+        info[ :need_rep2p ] = true
         @room_info[ :rep2p ] += 1
         return
       rescue Exception => e
@@ -158,7 +160,7 @@ module P2p2
         return
       end
 
-      info = @infos[ sock ]
+
 
       if info[ :need_decode ]
         len = data[ 0, 2 ].unpack( 'n' ).first
@@ -197,10 +199,13 @@ module P2p2
     end
 
     def write_room( sock )
-      if @renewings.include?( sock )
-        close_sock( sock )
-        @p1 = nil
-        @app = nil
+      if @closings.include?( sock )
+        info = close_sock( sock )
+
+        if info[ :p1 ]
+          add_closing( info[ :p1 ] )
+        end
+
         new_room
         return
       end
@@ -223,13 +228,12 @@ module P2p2
       end
 
       if @closings.include?( sock )
-        close_sock( sock )
-        return
-      end
+        info = close_sock( sock )
 
-      if @renewings.include?( sock )
-        close_sock( sock )
-        new_p1
+        if info[ :need_rep2p ]
+          new_p1
+        end
+
         return
       end
 
@@ -314,15 +318,6 @@ module P2p2
       add_write( sock )
     end
 
-    def add_renewing( sock )
-      unless @renewings.include?( sock )
-        @reads.delete( sock )
-        @renewings << sock
-      end
-
-      add_write( sock )
-    end
-
     def add_write( sock, data = nil, need_chunk = false )
       if data
         info = @infos[ sock ]
@@ -348,7 +343,6 @@ module P2p2
       @reads.delete( sock )
       @writes.delete( sock )
       @closings.delete( sock )
-      @renewings.delete( sock )
       @roles.delete( sock )
       info = @infos.delete( sock )
 
@@ -374,12 +368,13 @@ module P2p2
       rescue IO::WaitWritable, Errno::EINTR
       end
 
-      bytes = @title.unpack( "C*" ).map{ | c | c.chr }.join
+      title = @title.unpack( "C*" ).map{ | c | c.chr }.join
       room_info = {
-        wbuff: [ [ SET_TITLE, bytes.size ].pack( 'Cn' ), bytes ].join,
+        wbuff: [ [ SET_TITLE ].pack( 'C' ), title ].join,
         p2_sockaddr: nil,
         rep2p: 0,
-        updated_at: Time.new
+        updated_at: Time.new,
+        p1: nil
       }
       @room = room
       @room_info = room_info
@@ -401,24 +396,9 @@ module P2p2
       rescue Exception => e
         puts "connect p2 #{ e.class } #{ Time.new }"
         p1.close
-        add_renewing( @room )
+        add_closing( @room )
         return
       end
-
-      p1_info = {
-        wbuff: '',
-        cache: '',
-        filename: [ Process.pid, p1.object_id ].join( '-' ),
-        chunk_dir: @p1_chunk_dir,
-        chunks: [],
-        chunk_seed: 0,
-        need_decode: true
-      }
-      @p1 = p1
-      @p1_info = p1_info
-      @roles[ p1 ] = :p1
-      @infos[ p1 ] = p1_info
-      @reads << p1
 
       app = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
       app.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
@@ -428,6 +408,18 @@ module P2p2
       rescue IO::WaitWritable, Errno::EINTR
       end
 
+      p1_info = {
+        wbuff: '',
+        cache: '',
+        filename: [ Process.pid, p1.object_id ].join( '-' ),
+        chunk_dir: @p1_chunk_dir,
+        chunks: [],
+        chunk_seed: 0,
+        need_decode: true,
+        need_rep2p: false,
+        app: app
+      }
+
       app_info = {
         wbuff: '',
         cache: '',
@@ -435,11 +427,15 @@ module P2p2
         chunk_dir: @app_chunk_dir,
         chunks: [],
         chunk_seed: 0,
-        need_encode: true
+        need_encode: true,
+        p1: p1
       }
 
-      @app = app
-      @app_info = app_info
+      @roles[ p1 ] = :p1
+      @infos[ p1 ] = p1_info
+      @reads << p1
+      @roomd_info[ :p1 ] = p1
+
       @roles[ app ] = :app
       @infos[ app ] = app_info
       @reads << app
