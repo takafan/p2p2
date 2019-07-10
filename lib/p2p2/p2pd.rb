@@ -99,13 +99,13 @@ module P2p2
     def loop_expire
       Thread.new do
         loop do
-          sleep 60
+          sleep 3600
 
           if @infos.any?
             @mutex.synchronize do
               now = Time.new
 
-              @infos.select{ | _, info | now - info[ :updated_at ] > 600 }.each do | room, _ |
+              @infos.select{ | _, info | now - info[ :updated_at ] > 86400 }.each do | room, _ |
                 @ctlw.write( [ CTL_CLOSE_ROOM, [ room.object_id ].pack( 'N' ) ].join )
               end
             end
@@ -228,7 +228,7 @@ module P2p2
 
       info = @infos[ room ]
       room.write( info[ :wbuff ] )
-      add_closing( room )
+      @writes.delete( room )
     end
 
     def add_closing( sock )
@@ -243,7 +243,7 @@ module P2p2
     def add_write( sock, data = nil )
       if data
         info = @infos[ sock ]
-        info[ :wbuff ] << data
+        info[ :wbuff ] = data
       end
 
       unless @writes.include?( sock )

@@ -30,7 +30,7 @@ module P2p2
       @closings = []
       @roles = {}  # sock => :ctlr / :room / :p1 / :app
       @infos = {}
-      @retries = 0
+      @reconn_room = false
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
@@ -114,17 +114,17 @@ module P2p2
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @retries >= 2
+        if @reconn_room
           raise e
         end
 
         sleep 5
         add_closing( sock )
-        @retries += 1
+        @reconn_room = true
         return
       end
 
-      @retries = 0
+      @reconn_room = false
       info = @infos[ sock ]
       info[ :p2_sockaddr ] = data
       info[ :updated_at ] = Time.new
@@ -132,35 +132,32 @@ module P2p2
     end
 
     def read_p1( sock )
-      info = @infos[ sock ]
-
       begin
         data = sock.read_nonblock( PACK_SIZE )
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
       rescue Errno::ECONNREFUSED => e
-        if @room_info[ :rep2p ] >= REP2P_LIMIT
+        if @room_info[ :renew_p1_times ] >= REP2P_LIMIT
           raise e
         end
 
         sleep 1
         add_closing( sock )
-        info[ :need_rep2p ] = true
-        @room_info[ :rep2p ] += 1
+        info = @infos[ sock ]
+        info[ :need_renew ] = true
+        @room_info[ :renew_p1_times ] += 1
         return
       rescue Exception => e
         add_closing( sock )
         return
       end
 
-      @room_info[ :rep2p ] = 0
+      info = @infos[ sock ]
 
-      unless @app
+      unless info[ :app ]
         add_closing( sock )
         return
       end
-
-
 
       if info[ :need_decode ]
         len = data[ 0, 2 ].unpack( 'n' ).first
@@ -169,7 +166,8 @@ module P2p2
         info[ :need_decode ] = false
       end
 
-      add_write( @app, data, NEED_CHUNK )
+      add_write( info[ :app ], data )
+      @room_info[ :updated_at ] = Time.new
     end
 
     def read_app( sock )
@@ -182,12 +180,12 @@ module P2p2
         return
       end
 
-      unless @p1
+      info = @infos[ sock ]
+
+      unless info[ :p1 ]
         add_closing( sock )
         return
       end
-
-      info = @infos[ sock ]
 
       if info[ :need_encode ]
         data = @hex.encode( data )
@@ -195,62 +193,53 @@ module P2p2
         info[ :need_encode ] = false
       end
 
-      add_write( @p1, data, NEED_CHUNK )
+      add_write( info[ :p1 ], data )
     end
 
-    def write_room( sock )
-      if @closings.include?( sock )
-        info = close_sock( sock )
-
-        if info[ :p1 ]
-          add_closing( info[ :p1 ] )
-        end
-
+    def write_room( room )
+      if @closings.include?( room )
+        close_sock( room )
         new_room
         return
       end
 
-      info = @infos[ sock ]
-      data = info[ :wbuff ]
-
-      if data.empty?
-        @writes.delete( sock )
-        return
-      end
-
-      sock.write( data )
-      info[ :wbuff ].clear
+      info = @infos[ room ]
+      room.write( info[ :wbuff ] )
+      @writes.delete( room )
     end
 
-    def write_p1( sock )
-      if sock.closed?
+    def write_p1( p1 )
+      if p1.closed?
         return
       end
 
-      if @closings.include?( sock )
-        info = close_sock( sock )
+      if @closings.include?( p1 )
+        info = close_sock( p1 )
 
-        if info[ :need_rep2p ]
+        if info[ :need_renew ]
           new_p1
+          return
         end
 
+        add_closing( info[ :app ] )
+        add_closing( @room )
         return
       end
 
-      info = @infos[ sock ]
+      info = @infos[ p1 ]
       data, from = get_buff( info )
 
       if data.empty?
-        @writes.delete( sock )
+        @writes.delete( p1 )
         return
       end
 
       begin
-        written = sock.write_nonblock( data )
+        written = p1.write_nonblock( data )
       rescue IO::WaitWritable, Errno::EINTR, IO::WaitReadable
         return
       rescue Exception => e
-        add_closing( sock )
+        add_closing( p1 )
         return
       end
 
@@ -258,30 +247,31 @@ module P2p2
       info[ from ] = data
     end
 
-    def write_app( sock )
-      if sock.closed?
+    def write_app( app )
+      if app.closed?
         return
       end
 
-      if @closings.include?( sock )
-        close_sock( sock )
+      if @closings.include?( app )
+        info = close_sock( app )
+        add_closing( info[ :p1 ] )
         return
       end
 
-      info = @infos[ sock ]
+      info = @infos[ app ]
       data, from = get_buff( info )
 
       if data.empty?
-        @writes.delete( sock )
+        @writes.delete( app )
         return
       end
 
       begin
-        written = sock.write_nonblock( data )
+        written = app.write_nonblock( data )
       rescue IO::WaitWritable, Errno::EINTR, IO::WaitReadable
         return
       rescue Exception => e
-        add_closing( sock )
+        add_closing( app )
         return
       end
 
@@ -318,12 +308,12 @@ module P2p2
       add_write( sock )
     end
 
-    def add_write( sock, data = nil, need_chunk = false )
+    def add_write( sock, data = nil )
       if data
         info = @infos[ sock ]
         info[ :wbuff ] << data
 
-        if need_chunk && info[ :wbuff ].size >= CHUNK_SIZE
+        if info[ :wbuff ].size >= CHUNK_SIZE
           filename = [ info[ :filename ], info[ :chunk_seed ] ].join( '.' )
           chunk_path = File.join( info[ :chunk_dir ], filename )
           IO.binwrite( chunk_path, info[ :wbuff ] )
@@ -372,9 +362,8 @@ module P2p2
       room_info = {
         wbuff: [ [ SET_TITLE ].pack( 'C' ), title ].join,
         p2_sockaddr: nil,
-        rep2p: 0,
-        updated_at: Time.new,
-        p1: nil
+        renew_p1_times: 0,
+        updated_at: Time.new
       }
       @room = room
       @room_info = room_info
@@ -416,7 +405,7 @@ module P2p2
         chunks: [],
         chunk_seed: 0,
         need_decode: true,
-        need_rep2p: false,
+        need_renew: false,
         app: app
       }
 
@@ -434,7 +423,6 @@ module P2p2
       @roles[ p1 ] = :p1
       @infos[ p1 ] = p1_info
       @reads << p1
-      @roomd_info[ :p1 ] = p1
 
       @roles[ app ] = :app
       @infos[ app ] = app_info
