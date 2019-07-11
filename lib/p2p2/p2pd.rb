@@ -5,13 +5,24 @@ require 'socket'
 ##
 # P2p2::P2pd - 处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。配对服务器端。
 #
-#```
-#              p2pd                              p2pd
-#             ^                                 ^
-#            ^                                 ^
-#  ssh --> p2 --> encode --> nat --> nat --> p1 --> decode --> sshd
+# 1.
 #
-#```
+# ```
+#                    p2pd
+#                    ^  ^
+#                  ^    ^
+#      “周立波的房间”     “周立波的房间”
+#      ^                         ^
+#     ^                         ^
+#   p1 --> nat --><-- nat <-- p2
+#
+# ```
+#
+# 2.
+#
+# ```
+#   ssh --> p2 --> (encode) --> p1 --> (decode) --> sshd
+# ```
 #
 # usage
 # =====
@@ -38,8 +49,8 @@ module P2p2
       @writes = []
       @closings = []
       @roles = {} # sock => :roomd / :room
-      @rooms = {} # object_id => room
       @infos = {}
+      @rooms = {} # object_id => room
       @p1s = {} # title => room
       @p2s = {} # title => room
 
@@ -253,11 +264,11 @@ module P2p2
 
     def close_room( room )
       room.close
+      @rooms.delete( room.object_id )
       @reads.delete( room )
       @writes.delete( room )
       @closings.delete( room )
       @roles.delete( room )
-      @rooms.delete( room.object_id )
       info = @infos.delete( room )
 
       if info && info[ :title ]
@@ -265,9 +276,9 @@ module P2p2
 
         if File.exist?( title_path )
           File.delete( title_path )
-          @p1s.delete( title )
+          @p1s.delete( info[ :title ] )
         else
-          @p2s.delete( title )
+          @p2s.delete( info[ :title ] )
         end
       end
     end

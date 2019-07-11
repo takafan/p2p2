@@ -25,7 +25,7 @@
 
 2.
 ```
-  ssh --> p2 --> encode --> p1 --> decode --> sshd
+  ssh --> p2 --> (encode) --> p1 --> (decode) --> sshd
 ```
 
 安装：

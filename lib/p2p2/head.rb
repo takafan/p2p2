@@ -5,4 +5,5 @@ module P2p2
   SET_TITLE = 1
   PAIRING = 2
   CTL_CLOSE_ROOM = [ 1 ].pack( 'C' )
+  CTL_CLOSE_APP = [ 2 ].pack( 'C' )
 end
