@@ -139,7 +139,7 @@ module P2p2
         need_encode: true,
         rbuff: '',
         room: nil,
-        reconn_room: false,
+        reconn_room_at: nil,
         p1_sockaddr: nil,
         p2: nil,
         renew_p2_times: 0
@@ -194,17 +194,16 @@ module P2p2
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @app_info[ :reconn_room ]
+        if @app_info[ :reconn_room_at ] && ( Time.new - @app_info[ :reconn_room_at ] < 10 )
           raise e
         end
 
         sleep 5
         add_closing( room )
-        @app_info[ :reconn_room ] = true
+        @app_info[ :reconn_room_at ] = Time.new
         return
       end
 
-      @app_info[ :reconn_room ] = false
       @app_info[ :p1_sockaddr ] = data
       @app_info[ :updated_at ] = Time.new
       new_p2

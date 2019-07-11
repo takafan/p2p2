@@ -31,7 +31,7 @@ module P2p2
       @closings = []
       @roles = {}  # sock => :ctlr / :room / :p1 / :app
       @infos = {}
-      @reconn_room = false
+      @reconn_room_at = nil
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
@@ -123,17 +123,16 @@ module P2p2
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @reconn_room
+        if @reconn_room_at && ( Time.new - @reconn_room_at < 10 )
           raise e
         end
 
         sleep 5
         add_closing( room )
-        @reconn_room = true
+        @reconn_room_at = Time.new
         return
       end
 
-      @reconn_room = false
       info = @infos[ room ]
       info[ :p2_sockaddr ] = data
       info[ :updated_at ] = Time.new
