@@ -58,7 +58,7 @@ require 'p2p2/p2'
 P2p2::P2.new( 'your.server.ip', 5050, '0.0.0.0', 2222, '周立波' ).looping
 ```
 
-ssh:
+到家:
 
 ```bash
 ssh -p2222 libo@localhost
