@@ -194,7 +194,7 @@ module P2p2
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @app_info[ :reconn_room_times ] > 5
+        if @app_info[ :reconn_room_times ] >= REROOM_LIMIT
           raise e
         end
 
