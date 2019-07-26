@@ -3,7 +3,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2pd - 处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。配对服务器端。
+# P2p2::P2pd - 内网里的任意应用，访问另一个内网里的应用服务端。配对服务器端。
 #
 # 1.
 #
@@ -180,7 +180,7 @@ module P2p2
         end
 
         if @p1s.include?( title )
-          puts "p1 #{ title.inspect } already exist"
+          puts "p1 #{ title.inspect } already exist #{ Time.new }"
           add_closing( room )
           return
         end
@@ -213,7 +213,7 @@ module P2p2
         end
 
         if @p2s.include?( title )
-          puts "p2 #{ title.inspect } already exist"
+          puts "p2 #{ title.inspect } already exist #{ Time.new }"
           add_closing( room )
           return
         end

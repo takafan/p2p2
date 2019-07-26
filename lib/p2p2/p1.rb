@@ -4,7 +4,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P1 - 处于nat里的任意应用，访问处于另一个nat里的应用服务端，借助一根p2p管道。p1端。
+# P2p2::P1 - 内网里的任意应用，访问另一个内网里的应用服务端。p1端。
 #
 module P2p2
   class P1
@@ -31,7 +31,7 @@ module P2p2
       @closings = []
       @roles = {}  # sock => :ctlr / :room / :p1 / :app
       @infos = {}
-      @reconn_room_at = nil
+      @reconn_room_times = 0
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
@@ -91,7 +91,7 @@ module P2p2
         loop do
           sleep 60
 
-          if Time.new - @room_info[ :updated_at ] > 600
+          if Time.new - @room_info[ :updated_at ] > 1800
             @mutex.synchronize do
               @ctlw.write( CTL_CLOSE_ROOM )
             end
@@ -123,16 +123,17 @@ module P2p2
       rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
 
-        if @reconn_room_at && ( Time.new - @reconn_room_at < 10 )
+        if @reconn_room_times >= 5
           raise e
         end
 
         sleep 5
         add_closing( room )
-        @reconn_room_at = Time.new
+        @reconn_room_times += 1
         return
       end
 
+      @reconn_room_times = 0
       info = @infos[ room ]
       info[ :p2_sockaddr ] = data
       info[ :updated_at ] = Time.new
