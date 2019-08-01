@@ -191,16 +191,17 @@ module P2p2
         data = room.read_nonblock( PACK_SIZE )
       rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
         return
-      rescue Errno::ECONNREFUSED, EOFError, Errno::ECONNRESET => e
+      rescue Errno::ECONNREFUSED, Errno::ECONNRESET => e
         puts "read room #{ e.class } #{ Time.new }"
-
-        if @app_info[ :reconn_room_times ] >= REROOM_LIMIT
-          raise e
-        end
-
+        raise e if @app_info[ :reconn_room_times ] >= REROOM_LIMIT
+        @app_info[ :reconn_room_times ] += 1
         sleep 5
         add_closing( room )
-        @app_info[ :reconn_room_times ] += 1
+        return
+      rescue EOFError => e
+        puts "read room #{ e.class } #{ Time.new }"
+        sleep 5
+        add_closing( room )
         return
       end
 
