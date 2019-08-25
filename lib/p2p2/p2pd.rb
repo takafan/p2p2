@@ -35,66 +35,45 @@ require 'socket'
 #
 # 4. ssh -p2222 libo@localhost
 #
+# 包结构
+# ======
+#
+# Q>: 1+ app/shadow_id -> Q>: pack_id  -> traffic
+#     0  ctlmsg        -> C:  1 peer addr     -> p1/p2_sockaddr
+#                             2 heartbeat     -> C: random char
+#                             3 a new app     -> Q>: app_id
+#                             4 paired        -> Q>Q>: app_id shadow_id
+#                             5 shadow status -> Q>Q>Q>: shadow_id biggest_shadow_pack_id continue_app_pack_id
+#                             6 app status    -> Q>Q>Q>: app_id biggest_app_pack_id continue_shadow_pack_id
+#                             7 miss          -> Q>Q>Q>: app/shadow_id pack_id_begin pack_id_end
+#                             8 fin1          -> Q>: app/shadow_id
+#                             9 got fin1      -> Q>: app/shadow_id
+#                            10 fin2          -> Q>: app/shadow_id
+#                            11 got fin2      -> Q>: app/shadow_id
+#                            12 p1 fin
+#                            13 p2 fin
+#
 module P2p2
   class P2pd
 
     ##
-    # roomd_port    配对服务器端口
-    # roomd_dir     可在该目录下看到所有的p1
-    def initialize( roomd_port = 5050, roomd_dir = '/tmp' )
-      @roomd_port = roomd_port
-      @roomd_dir = roomd_dir
-      @mutex = Mutex.new
-      @reads = []
-      @writes = []
-      @closings = []
-      @roles = {} # sock => :roomd / :room
-      @infos = {}
-      @rooms = {} # object_id => room
-      @p1s = {} # title => room
-      @p2s = {} # title => room
+    # p2pd_port 配对服务器端口
+    # p2pd_dir  可在该目录下看到所有的房间
+    def initialize( p2pd_port = 5050, p2pd_dir = '/tmp' )
+      p2pd = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
+      p2pd.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
+      p2pd.bind( Socket.pack_sockaddr_in( p2pd_port, '0.0.0.0' ) )
 
-      ctlr, ctlw = IO.pipe
-      @ctlw = ctlw
-      @roles[ ctlr ] = :ctlr
-      @reads << ctlr
-
-      roomd = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
-      roomd.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
-      roomd.bind( Socket.pack_sockaddr_in( @roomd_port, '0.0.0.0' ) )
-      roomd.listen( 511 )
-
-      @roles[ roomd ] = :roomd
-      @reads << roomd
+      @p2pd = p2pd
+      @p2pd_dir = p2pd_dir
     end
 
     def looping
       puts 'looping'
 
-      loop_expire
-
       loop do
-        rs, ws = IO.select( @reads, @writes )
-
-        @mutex.synchronize do
-          rs.each do | sock |
-            case @roles[ sock ]
-            when :ctlr
-              read_ctlr( sock )
-            when :roomd
-              read_roomd( sock )
-            when :room
-              read_room( sock )
-            end
-          end
-
-          ws.each do | sock |
-            case @roles[ sock ]
-            when :room
-              write_room( sock )
-            end
-          end
-        end
+        rs, _ = IO.select( [ @p2pd ] )
+        read_p2pd( rs.first )
       end
     rescue Interrupt => e
       puts e.class
@@ -107,179 +86,49 @@ module P2p2
 
     private
 
-    def loop_expire
-      Thread.new do
-        loop do
-          sleep 3600
+    def read_p2pd( p2pd )
+      data, addrinfo, rflags, *controls = p2pd.recvmsg
+      return if data.size > 255
 
-          if @infos.any?
-            @mutex.synchronize do
-              now = Time.new
+      sockaddr = addrinfo.to_sockaddr
+      title_path = File.join( @p2pd_dir, data )
 
-              @infos.select{ | _, info | now - info[ :updated_at ] > 86400 }.each do | room, _ |
-                @ctlw.write( [ CTL_CLOSE_ROOM, [ room.object_id ].pack( 'N' ) ].join )
-              end
-            end
-          end
-        end
+      unless File.exist?( title_path )
+        write_title( title_path, sockaddr )
+        return
       end
+
+      if Time.new - File.mtime( title_path ) > 300
+        write_title( title_path, sockaddr )
+        return
+      end
+
+      op_sockaddr = IO.binread( title_path )
+
+      if Addrinfo.new( op_sockaddr ).ip_address == addrinfo.ip_address
+        write_title( title_path, sockaddr )
+        return
+      end
+
+      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ op_sockaddr }", sockaddr )
+      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ sockaddr }", op_sockaddr )
     end
 
-    def read_ctlr( ctlr )
-      case ctlr.read( 1 )
-      when CTL_CLOSE_ROOM
-        room_id = ctlr.read( 4 ).unpack( 'N' ).first
-        room = @rooms[ room_id ]
-
-        if room
-          add_closing( room )
-        end
-      end
-    end
-
-    def read_roomd( roomd )
+    def write_title( title_path, sockaddr )
       begin
-        room, addrinfo = roomd.accept_nonblock
-      rescue IO::WaitReadable, Errno::EINTR
-        return
+        # puts "debug write title #{ title_path } #{ Time.new }"
+        IO.binwrite( title_path, sockaddr )
+      rescue Errno::ENOENT, ArgumentError => e
+        puts "binwrite #{ e.class } #{ Time.new }"
       end
-
-      @rooms[ room.object_id ] = room
-      @roles[ room ] = :room
-      @infos[ room ] = {
-        title: nil,
-        wbuff: '',
-        sockaddr: addrinfo.to_sockaddr,
-        updated_at: Time.new
-      }
-      @reads << room
     end
 
-    def read_room( room )
+    def send_pack( sock, data, target_sockaddr )
       begin
-        data = room.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
-        return
-      rescue Exception => e
-        add_closing( room )
-        return
-      end
-
-      info = @infos[ room ]
-      info[ :updated_at ] = Time.new
-      ctl_num = data[ 0 ].unpack( 'C' ).first
-
-      case ctl_num
-      when SET_TITLE
-        title = data[ 1..-1 ]
-
-        if title.size > 255
-          puts 'title too long'
-          add_closing( room )
-          return
-        end
-
-        if @p1s.include?( title )
-          puts "p1 #{ title.inspect } already exist #{ Time.new }"
-          add_closing( room )
-          return
-        end
-
-        if @p2s.include?( title )
-          p2 = @p2s[ title ]
-          p2_info = @infos[ p2 ]
-          add_write( room, p2_info[ :sockaddr ] )
-          add_write( p2, info[ :sockaddr ] )
-          return
-        end
-
-        begin
-          File.open( File.join( @roomd_dir, title ), 'w' )
-        rescue Errno::ENOENT, ArgumentError => e
-          puts "open title path #{ e.class }"
-          add_closing( room )
-          return
-        end
-
-        info[ :title ] = title
-        @p1s[ title ] = room
-      when PAIRING
-        title = data[ 1..-1 ]
-
-        if title.size > 255
-          puts 'pairing title too long'
-          add_closing( room )
-          return
-        end
-
-        if @p2s.include?( title )
-          puts "p2 #{ title.inspect } already exist #{ Time.new }"
-          add_closing( room )
-          return
-        end
-
-        if @p1s.include?( title )
-          p1 = @p1s[ title ]
-          p1_info = @infos[ p1 ]
-          add_write( room, p1_info[ :sockaddr ] )
-          add_write( p1, info[ :sockaddr ] )
-          return
-        end
-
-        info[ :title ] = title
-        @p2s[ title ] = room
-      end
-    end
-
-    def write_room( room )
-      if @closings.include?( room )
-        close_room( room )
-        return
-      end
-
-      info = @infos[ room ]
-      room.write( info[ :wbuff ] )
-      @writes.delete( room )
-    end
-
-    def add_closing( sock )
-      unless @closings.include?( sock )
-        @reads.delete( sock )
-        @closings <<  sock
-      end
-
-      add_write( sock )
-    end
-
-    def add_write( sock, data = nil )
-      if data
-        info = @infos[ sock ]
-        info[ :wbuff ] = data
-      end
-
-      unless @writes.include?( sock )
-        @writes << sock
-      end
-    end
-
-    def close_room( room )
-      room.close
-      @rooms.delete( room.object_id )
-      @reads.delete( room )
-      @writes.delete( room )
-      @closings.delete( room )
-      @roles.delete( room )
-      info = @infos.delete( room )
-
-      if info && info[ :title ]
-        title_path = File.join( @roomd_dir, info[ :title ] )
-
-        if File.exist?( title_path )
-          File.delete( title_path )
-          @p1s.delete( info[ :title ] )
-        else
-          @p2s.delete( info[ :title ] )
-        end
+        # puts "debug sendmsg #{ data.inspect } #{ Time.new }"
+        sock.sendmsg( data, 0, target_sockaddr )
+      rescue IO::WaitWritable, Errno::EINTR => e
+        puts "sendmsg #{ e.class } #{ Time.new }"
       end
     end
   end

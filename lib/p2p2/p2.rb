@@ -6,20 +6,32 @@ require 'socket'
 ##
 # P2p2::P2 - 内网里的任意应用，访问另一个内网里的应用服务端。p2端。
 #
+# 两套关闭
+# ========
+#
+# 1-1. app.close -> ext.is_shadow_closed ? no -> send fin1 loop
+# 1-2. recv got_fin1 -> break loop
+# 1-3. recv fin2 -> send got_fin2 -> del ext
+#
+# 2-1. recv fin1 -> send got_fin1 -> ext.is_shadow_closed = true
+# 2-2. all sent && ext.biggest_shadow_pack_id == ext.continue_shadow_pack_id -> add closing app
+# 2-3. app.close -> ext.is_shadow_closed ? yes -> del ext -> loop send fin2
+# 2-4. recv got_fin2 -> break loop
+#
 module P2p2
   class P2
 
     ##
-    # roomd_host    配对服务器ip
-    # roomd_port    配对服务器端口
+    # p2pd_host     配对服务器ip
+    # p2pd_port     配对服务器端口
     # appd_host     代理地址 不限制访问：'0.0.0.0'，或者只允许本地访问：'127.0.0.1'
     # appd_port     代理端口
     # title         约定的房间名
     # app_chunk_dir 文件缓存目录，缓存app来不及写的流量
     # p2_chunk_dir  文件缓存目录，缓存p2来不及写的流量
     #
-    def initialize( roomd_host, roomd_port, appd_host, appd_port, title, app_chunk_dir = '/tmp', p2_chunk_dir = '/tmp' )
-      @roomd_sockaddr = Socket.sockaddr_in( roomd_port, roomd_host )
+    def initialize( p2pd_host, p2pd_port, appd_host, appd_port, title, app_chunk_dir = '/tmp', p2_chunk_dir = '/tmp' )
+      @p2pd_sockaddr = Socket.sockaddr_in( p2pd_port, p2pd_host )
       @appd_sockaddr = Socket.sockaddr_in( appd_port, appd_host )
       @title = title
       @app_chunk_dir = app_chunk_dir
@@ -29,21 +41,21 @@ module P2p2
       @reads = []
       @writes = []
       @closings = []
-      @roles = {}  # sock => :appd / :app / :room / :p2
+      @socks = {} # object_id => sock
+      @roles = {} # sock => :ctlr / :appd / :app / :p2
       @infos = {}
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
       @roles[ ctlr ] = :ctlr
-      @reads << ctlr
-
-      new_appd
+      add_read( ctlr )
     end
 
     def looping
       puts 'looping'
 
-      loop_expire
+      new_appd
+      new_p2
 
       loop do
         rs, ws = IO.select( @reads, @writes )
@@ -57,8 +69,6 @@ module P2p2
               read_appd( sock )
             when :app
               read_app( sock )
-            when :room
-              read_room( sock )
             when :p2
               read_p2( sock )
             end
@@ -68,8 +78,6 @@ module P2p2
             case @roles[ sock ]
             when :app
               write_app( sock )
-            when :room
-              write_room( sock )
             when :p2
               write_p2( sock )
             end
@@ -82,33 +90,36 @@ module P2p2
     end
 
     def quit!
+      if @p2 && !@p2.closed? && @p2_info[ :p1_addr ]
+        ctlmsg = [ 0, P2_FIN ].pack( 'Q>C' )
+        send_pack( @p2, ctlmsg, @p2_info[ :p1_addr ] )
+      end
+
       exit
     end
 
     private
-
-    def loop_expire
-      Thread.new do
-        loop do
-          sleep 60
-
-          if @app && ( Time.new - @app_info[ :updated_at ] > 1800 )
-            @mutex.synchronize do
-              @ctlw.write( CTL_CLOSE_APP )
-            end
-          end
-        end
-      end
-    end
 
     ##
     # read ctlr
     #
     def read_ctlr( ctlr )
       case ctlr.read( 1 )
-      when CTL_CLOSE_APP
-        unless @app.closed?
-          add_closing( @app )
+      when CTL_CLOSE_SOCK
+        sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+        sock = @socks[ sock_id ]
+
+        if sock
+          add_closing( sock )
+        end
+      when CTL_RESUME
+        p2_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+
+        puts "resume #{ p2_id } #{ Time.new }"
+        p2 = @socks[ p2_id ]
+
+        if p2
+          add_write( p2 )
         end
       end
     end
@@ -123,34 +134,35 @@ module P2p2
         return
       end
 
-      if @app && !@app.closed?
-        puts "app already exist, ignore"
-        app.close
-        return
-      end
+      app_id = app.object_id
 
-      app_info = {
-        wbuff: '',
-        cache: '',
-        filename: [ Process.pid, app.object_id ].join( '-' ),
-        chunk_dir: @app_chunk_dir,
-        chunks: [],
-        chunk_seed: 0,
-        need_encode: true,
-        rbuff: '',
-        room: nil,
-        reconn_room_times: 0,
-        p1_sockaddr: nil,
-        p2: nil,
-        renew_p2_times: 0
-      }
-      @app = app
-      @app_info = app_info
+      @socks[ app_id ] = app
       @roles[ app ] = :app
-      @infos[ app ] = app_info
-      @reads << app
+      @infos[ app ] = {
+        wbuff: '',  # 写前缓存
+        cache: '',  # 块读出缓存
+        chunks: [], # 块队列，写前达到块大小时结一个块 filename
+        spring: 0,  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
+        p2: @p2
+      }
 
-      new_room
+      @p2_info[ :apps ] << app
+      @p2_info[ :app_exts ][ app_id ] = {
+        app: app,
+        wmems: {},                  # 写后缓存 pack_id => data
+        send_ats: {},               # 上一次发出时间 pack_id => send_at
+        biggest_pack_id: 0,         # 发到几
+        continue_shadow_pack_id: 0, # 收到几
+        pieces: {},                 # 跳号包 shadow_pack_id => data
+        shadow_id: nil,             # 对面id
+        is_shadow_closed: false,    # 对面是否已关闭
+        biggest_shadow_pack_id: 0,  # 对面发到几
+        completed_pack_id: 0,       # 完成到几（对面收到几）
+        last_traffic_at: nil        # 有流量发出，或者有更新收到几，时间戳
+      }
+
+      add_read( app )
+      loop_send_a_new_app( app )
     end
 
     ##
@@ -159,7 +171,7 @@ module P2p2
     def read_app( app )
       begin
         data = app.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
+      rescue IO::WaitReadable, Errno::EINTR
         return
       rescue Exception => e
         add_closing( app )
@@ -167,93 +179,230 @@ module P2p2
       end
 
       info = @infos[ app ]
+      p2 = info[ :p2 ]
 
-      if info[ :need_encode ]
-        data = @hex.encode( data )
-        data = [ [ data.size ].pack( 'n' ), data ].join
-        info[ :need_encode ] = false
-      end
-
-      if info[ :p2 ]
-        add_write( info[ :p2 ], data )
-      else
-        info[ :rbuff ] << data
-      end
-
-      info[ :updated_at ] = Time.new
-    end
-
-    ##
-    # read room
-    #
-    def read_room( room )
-      begin
-        data = room.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
-        return
-      rescue Errno::ECONNREFUSED, Errno::ECONNRESET => e
-        puts "read room #{ e.class } #{ Time.new }"
-        raise e if @app_info[ :reconn_room_times ] >= REROOM_LIMIT
-        @app_info[ :reconn_room_times ] += 1
-        sleep 5
-        add_closing( room )
-        return
-      rescue EOFError => e
-        puts "read room #{ e.class } #{ Time.new }"
-        sleep 5
-        add_closing( room )
+      if p2.closed?
+        add_closing( app )
         return
       end
 
-      @app_info[ :reconn_room_times ] = 0
-      @app_info[ :p1_sockaddr ] = data
-      @app_info[ :updated_at ] = Time.new
-      new_p2
+      p2_info = @infos[ p2 ]
+      p2_info[ :wbuffs ] << [ app.object_id, data ]
+
+      if p2_info[ :wbuffs ].size >= WBUFFS_LIMIT
+        spring = p2_info[ :chunks ].size > 0 ? ( p2_info[ :spring ] + 1 ) : 0
+        filename = "#{ p2.object_id }.#{ spring }"
+        chunk_path = File.join( @p2_chunk_dir, filename )
+        IO.binwrite( chunk_path, p2_info[ :wbuffs ].map{ | app_id, data | "#{ [ app_id, data.bytesize ].pack( 'Q>n' ) }#{ data }" }.join )
+        p2_info[ :chunks ] << filename
+        p2_info[ :spring ] = spring
+        p2_info[ :wbuffs ].clear
+      end
+
+      unless p2_info[ :paused ]
+        add_write( p2 )
+      end
     end
 
     ##
     # read p2
     #
     def read_p2( p2 )
-      begin
-        data = p2.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR, IO::WaitWritable
-        return
-      rescue Errno::ECONNREFUSED => e
-        puts "read p2 #{ e.class } #{ Time.new }"
+      data, addrinfo, rflags, *controls = p2.recvmsg
+      now = Time.new
+      info = @infos[ p2 ]
+      info[ :last_coming_at ] = now
+      shadow_id = data[ 0, 8 ].unpack( 'Q>' ).first
 
-        if @app_info[ :renew_p2_times ] >= REP2P_LIMIT
-          raise e
+      if shadow_id == 0
+        case data[ 8 ].unpack( 'C' ).first
+        when PEER_ADDR
+          return if addrinfo.to_sockaddr != @p2pd_sockaddr
+
+          unless info[ :p1_addr ]
+            # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
+            info[ :p1_addr ] = data[ 9..-1 ]
+            loop_send_status( p2 )
+          end
+
+          ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+          send_pack( p2, ctlmsg, info[ :p1_addr ] )
+        when PAIRED
+          app_id, shadow_id = data[ 9, 16 ].unpack( 'Q>Q>' )
+          # puts "debug got PAIRED #{ app_id } #{ shadow_id } #{ Time.new }"
+
+          ext = info[ :app_exts ][ app_id ]
+          return if ext.nil? || ext[ :shadow_id ]
+
+          ext[ :shadow_id ] = shadow_id
+          info[ :shadow_ids ][ shadow_id ] = app_id
+        when SHADOW_STATUS
+          shadow_id, biggest_shadow_pack_id, continue_app_pack_id  = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
+          app_id = info[ :shadow_ids ][ shadow_id ]
+          return unless app_id
+
+          ext = info[ :app_exts ][ app_id ]
+          return unless ext
+
+          # 更新对面发到几
+          if biggest_shadow_pack_id > ext[ :biggest_shadow_pack_id ]
+            ext[ :biggest_shadow_pack_id ] = biggest_shadow_pack_id
+          end
+
+          # 更新对面收到几，释放写后
+          if continue_app_pack_id > ext[ :completed_pack_id ]
+            pack_ids = ext[ :wmems ].keys.select { | pack_id | pack_id <= continue_app_pack_id }
+
+            pack_ids.each do | pack_id |
+              ext[ :wmems ].delete( pack_id )
+              ext[ :send_ats ].delete( pack_id )
+            end
+
+            ext[ :completed_pack_id ] = continue_app_pack_id
+          end
+
+          if ext[ :is_shadow_closed ] && ( ext[ :biggest_shadow_pack_id ] == ext[ :continue_shadow_pack_id ] )
+            add_write( ext[ :app ] )
+            return
+          end
+
+          # 发miss
+          if !ext[ :app ].closed? && ( ext[ :continue_shadow_pack_id ] < ext[ :biggest_shadow_pack_id ] )
+            ranges = []
+            curr_pack_id = ext[ :continue_shadow_pack_id ] + 1
+
+            ext[ :pieces ].keys.sort.each do | pack_id |
+              if pack_id > curr_pack_id
+                ranges << [ curr_pack_id, pack_id - 1 ]
+              end
+
+              curr_pack_id = pack_id + 1
+            end
+
+            if curr_pack_id <= ext[ :biggest_shadow_pack_id ]
+              ranges << [ curr_pack_id, ext[ :biggest_shadow_pack_id ] ]
+            end
+
+            # puts "debug #{ ext[ :continue_shadow_pack_id ] }/#{ ext[ :biggest_shadow_pack_id ] } send MISS #{ ranges.size }"
+            ranges.each do | pack_id_begin, pack_id_end |
+              ctlmsg = [
+                0,
+                MISS,
+                shadow_id,
+                pack_id_begin,
+                pack_id_end
+              ].pack( 'Q>CQ>Q>Q>' )
+
+              send_pack( p2, ctlmsg, info[ :p1_addr ] )
+            end
+          end
+        when MISS
+          app_id, pack_id_begin, pack_id_end = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
+          ext = info[ :app_exts ][ app_id ]
+          return unless ext
+
+          ( pack_id_begin..pack_id_end ).each do | pack_id |
+            send_at = ext[ :send_ats ][ pack_id ]
+
+            if send_at
+              break if now - send_at < STATUS_INTERVAL
+
+              info[ :resendings ] << [ app_id, pack_id ]
+            end
+          end
+
+          add_write( p2 )
+        when FIN1
+          shadow_id = data[ 9, 8 ].unpack( 'Q>' ).first
+          ctlmsg = [
+            0,
+            GOT_FIN1,
+            shadow_id
+          ].pack( 'Q>CQ>' )
+
+          # puts "debug 2-1. recv fin1 -> send got_fin1 -> ext.is_shadow_closed = true #{ shadow_id } #{ Time.new }"
+          send_pack( p2, ctlmsg, info[ :p1_addr ] )
+
+          app_id = info[ :shadow_ids ][ shadow_id ]
+          return unless app_id
+
+          ext = info[ :app_exts ][ app_id ]
+          return unless ext
+
+          ext[ :is_shadow_closed ] = true
+        when GOT_FIN1
+          # puts "debug 1-2. recv got_fin1 -> break loop #{ Time.new }"
+          app_id = data[ 9, 8 ].unpack( 'Q>' ).first
+          info[ :fin1s ].delete( app_id )
+        when FIN2
+          # puts "debug 1-3. recv fin2 -> send got_fin2 -> del ext #{ Time.new }"
+          shadow_id = data[ 9, 8 ].unpack( 'Q>' ).first
+          ctlmsg = [
+            0,
+            GOT_FIN2,
+            shadow_id
+          ].pack( 'Q>CQ>' )
+
+          send_pack( p2, ctlmsg, info[ :p1_addr ] )
+
+          app_id = info[ :shadow_ids ].delete( shadow_id )
+          return unless app_id
+
+          info[ :app_exts ].delete( app_id )
+        when GOT_FIN2
+          # puts "debug 2-4. recv got_fin2 -> break loop #{ Time.new }"
+          app_id = data[ 9, 8 ].unpack( 'Q>' ).first
+          info[ :fin2s ].delete( app_id )
+        when P1_FIN
+          raise "p1 fin #{ Time.new }"
         end
 
-        sleep 1
-        add_closing( p2 )
-        info = @infos[ p2 ]
-        info[ :need_renew ] = true
-        @app_info[ :renew_p2_times ] += 1
-        return
-      rescue Exception => e
-        puts "read p2 #{ e.class } #{ Time.new }"
-        add_closing( p2 )
         return
       end
 
-      if @app.nil? || @app.closed?
-        add_closing( p2 )
-        return
+      app_id = info[ :shadow_ids ][ shadow_id ]
+      return unless app_id
+
+      ext = info[ :app_exts ][ app_id ]
+      return if ext.nil? || ext[ :app ].closed?
+
+      pack_id = data[ 8, 8 ].unpack( 'Q>' ).first
+      return if ( pack_id <= ext[ :continue_shadow_pack_id ] ) || ext[ :pieces ].include?( pack_id )
+
+      data = data[ 16..-1 ]
+
+      # 解混淆
+      if pack_id == 1
+        data = @hex.decode( data )
       end
 
-      info = @infos[ p2 ]
+      # 放进shadow的写前缓存，跳号放碎片缓存
+      if pack_id - ext[ :continue_shadow_pack_id ] == 1
+        while ext[ :pieces ].include?( pack_id + 1 )
+          data << ext[ :pieces ].delete( pack_id + 1 )
+          pack_id += 1
+        end
 
-      if info[ :need_decode ]
-        len = data[ 0, 2 ].unpack( 'n' ).first
-        head = @hex.decode( data[ 2, len ] )
-        data = head + data[ ( 2 + len )..-1 ]
-        info[ :need_decode ] = false
+        ext[ :continue_shadow_pack_id ] = pack_id
+        ext[ :last_traffic_at ] = now
+
+        app_info = @infos[ ext[ :app ] ]
+        app_info[ :wbuff ] << data
+
+        if app_info[ :wbuff ].bytesize >= CHUNK_SIZE
+          spring = app_info[ :chunks ].size > 0 ? ( app_info[ :spring ] + 1 ) : 0
+          filename = "#{ app_id }.#{ spring }"
+          chunk_path = File.join( @app_chunk_dir, filename )
+          IO.binwrite( chunk_path, app_info[ :wbuff ] )
+          app_info[ :chunks ] << filename
+          app_info[ :spring ] = spring
+          app_info[ :wbuff ].clear
+        end
+
+        add_write( ext[ :app ] )
+      else
+        ext[ :pieces ][ pack_id ] = data
       end
-
-      add_write( @app, data )
-      @app_info[ :updated_at ] = Time.new
     end
 
     ##
@@ -261,30 +410,58 @@ module P2p2
     #
     def write_app( app )
       if @closings.include?( app )
-        info = close_sock( app )
-
-        if info[ :room ] && !info[ :room ].closed?
-          add_closing( info[ :room ] )
-        end
-
-        if info[ :p2 ] && !info[ :p2 ].closed?
-          add_closing( info[ :p2 ] )
-        end
-
+        close_app( app )
         return
       end
 
       info = @infos[ app ]
-      data, from = get_buff( info )
+
+      # 取写前
+      data = info[ :cache ]
+      from = :cache
 
       if data.empty?
+        if info[ :chunks ].any?
+          path = File.join( @app_chunk_dir, info[ :chunks ].shift )
+
+          begin
+            data = IO.binread( path )
+            File.delete( path )
+          rescue Errno::ENOENT
+            add_closing( app )
+            return
+          end
+        else
+          data = info[ :wbuff ]
+          from = :wbuff
+        end
+      end
+
+      if data.empty?
+        p2 = info[ :p2 ]
+
+        if p2.closed?
+          add_closing( app )
+          return
+        end
+
+        p2_info = @infos[ p2 ]
+        ext = p2_info[ :app_exts ][ app.object_id ]
+
+        if ext[ :is_shadow_closed ] && ( ext[ :biggest_shadow_pack_id ] == ext[ :continue_shadow_pack_id ] )
+          # puts "debug 2-2. all sent && ext.biggest_shadow_pack_id == ext.continue_shadow_pack_id -> add closing app #{ Time.new }"
+          add_closing( app )
+          return
+        end
+
         @writes.delete( app )
         return
       end
 
       begin
         written = app.write_nonblock( data )
-      rescue IO::WaitWritable, Errno::EINTR, IO::WaitReadable
+      rescue IO::WaitWritable, Errno::EINTR => e
+        info[ from ] = data
         return
       rescue Exception => e
         add_closing( app )
@@ -296,131 +473,92 @@ module P2p2
     end
 
     ##
-    # write room
-    #
-    def write_room( room )
-      if @closings.include?( room )
-        close_sock( room )
-
-        unless @app.closed?
-          add_closing( @app )
-        end
-
-        return
-      end
-
-      info = @infos[ room ]
-      room.write( info[ :wbuff ] )
-      @writes.delete( room )
-    end
-
-    ##
     # write p2
     #
     def write_p2( p2 )
       if @closings.include?( p2 )
-        info = close_sock( p2 )
-
-        if info[ :need_renew ]
-          new_p2
-          return
-        end
-
-        unless @app_info[ :room ].closed?
-          add_closing( @app_info[ :room ] )
-        end
-
+        close_p2( p2 )
+        new_p2
         return
       end
 
+      now = Time.new
       info = @infos[ p2 ]
-      data, from = get_buff( info )
 
-      if data.empty?
+      # 重传
+      while info[ :resendings ].any?
+        app_id, pack_id = info[ :resendings ].shift
+        ext = info[ :app_exts ][ app_id ]
+
+        if ext
+          pack = ext[ :wmems ][ pack_id ]
+
+          if pack
+            send_pack( p2, pack, info[ :p1_addr ] )
+            ext[ :last_traffic_at ] = now
+            return
+          end
+        end
+      end
+
+      # 若写后到达上限，暂停取写前
+      if info[ :app_exts ].map{ | _, ext | ext[ :wmems ].size }.sum >= WMEMS_LIMIT
+        unless info[ :paused ]
+          puts "pause #{ Time.new }"
+          info[ :paused ] = true
+        end
+
         @writes.delete( p2 )
         return
       end
 
-      begin
-        written = p2.write_nonblock( data )
-      rescue IO::WaitWritable, Errno::EINTR, IO::WaitReadable
+      # 取写前
+      if info[ :caches ].any?
+        app_id, data = info[ :caches ].shift
+      elsif info[ :chunks ].any?
+        path = File.join( @p2_chunk_dir, info[ :chunks ].shift )
+
+        begin
+          data = IO.binread( path )
+          File.delete( path )
+        rescue Errno::ENOENT
+          add_closing( p2 )
+          return
+        end
+
+        caches = []
+
+        until data.empty?
+          app_id, pack_size = data[ 0, 10 ].unpack( 'Q>n' )
+          caches << [ app_id, data[ 10, pack_size ] ]
+          data = data[ ( 10 + pack_size )..-1 ]
+        end
+
+        app_id, data = caches.shift
+        info[ :caches ] = caches
+      elsif info[ :wbuffs ].any?
+        app_id, data = info[ :wbuffs ].shift
+      else
+        @writes.delete( p2 )
         return
-      rescue Exception => e
-        add_closing( p2 )
-        return
       end
 
-      data = data[ written..-1 ]
-      info[ from ] = data
-    end
+      ext = info[ :app_exts ][ app_id ]
 
-    def get_buff( info )
-      data, from = info[ :cache ], :cache
+      if ext
+        pack_id = ext[ :biggest_pack_id ] + 1
 
-      if data.empty?
-        if info[ :chunks ].any?
-          path = File.join( info[ :chunk_dir ], info[ :chunks ].shift )
-          data = info[ :cache ] = IO.binread( path )
-
-          begin
-            File.delete( path )
-          rescue Errno::ENOENT
-          end
-        else
-          data, from = info[ :wbuff ], :wbuff
+        if pack_id == 1
+          data = @hex.encode( data )
         end
+
+        pack = "#{ [ app_id, pack_id ].pack( 'Q>Q>' ) }#{ data }"
+        send_pack( p2, pack, info[ :p1_addr ] )
+        ext[ :biggest_pack_id ] = pack_id
+        ext[ :wmems ][ pack_id ] = pack
+        ext[ :send_ats ][ pack_id ] = now
+        ext[ :last_traffic_at ] = now
       end
-
-      [ data, from ]
-    end
-
-    def add_closing( sock )
-      unless @closings.include?( sock )
-        @reads.delete( sock )
-        @closings << sock
-      end
-
-      add_write( sock )
-    end
-
-    def add_write( sock, data = nil )
-      if data
-        info = @infos[ sock ]
-        info[ :wbuff ] << data
-
-        if info[ :wbuff ].size >= CHUNK_SIZE
-          filename = [ info[ :filename ], info[ :chunk_seed ] ].join( '.' )
-          chunk_path = File.join( info[ :chunk_dir ], filename )
-          IO.binwrite( chunk_path, info[ :wbuff ] )
-          info[ :chunks ] << filename
-          info[ :chunk_seed ] += 1
-          info[ :wbuff ].clear
-        end
-      end
-
-      unless @writes.include?( sock )
-        @writes << sock
-      end
-    end
-
-    def close_sock( sock )
-      sock.close
-      @reads.delete( sock )
-      @writes.delete( sock )
-      @closings.delete( sock )
-      @roles.delete( sock )
-      info = @infos.delete( sock )
-
-      if info && info[ :chunks ]
-        info[ :chunks ].each do | filename |
-          begin
-            File.delete( File.join( info[ :chunk_dir ], filename ) )
-          rescue Errno::ENOENT
-          end
-        end
-      end
-
-      info
     end
 
     def new_appd
@@ -431,66 +569,292 @@ module P2p2
       appd.listen( 511 )
 
       @roles[ appd ] = :appd
-      @reads << appd
-    end
-
-    def new_room
-      room = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
-      room.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
-      room.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
-
-      begin
-        room.connect_nonblock( @roomd_sockaddr )
-      rescue IO::WaitWritable, Errno::EINTR
-      end
-
-      bytes = @title.unpack( "C*" ).map{ | c | c.chr }.join
-      room_info = {
-        wbuff: [ [ PAIRING ].pack( 'C' ), bytes ].join
-      }
-      @roles[ room ] = :room
-      @infos[ room ] = room_info
-      @reads << room
-      @writes << room
-      @app_info[ :room ] = room
-      @app_info[ :updated_at ] = Time.new
+      add_read( appd )
     end
 
     def new_p2
-      p2 = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
+      p2 = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
       p2.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
-      p2.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
-      p2.bind( @app_info[ :room ].local_address ) # use the hole
-
-      begin
-        p2.connect_nonblock( @app_info[ :p1_sockaddr ] )
-      rescue IO::WaitWritable, Errno::EINTR
-      rescue Exception => e
-        puts "connect p1 #{ e.class } #{ Time.new }"
-        p2.close
-        add_closing( @app_info[ :room ] )
-        return
-      end
+      p2.bind( Socket.sockaddr_in( 0, '0.0.0.0' ) )
 
       p2_info = {
-        wbuff: @app_info[ :rbuff ],
-        cache: '',
-        filename: [ Process.pid, p2.object_id ].join( '-' ),
-        chunk_dir: @p2_chunk_dir,
-        chunks: [],
-        chunk_seed: 0,
-        need_decode: true,
-        need_renew: false
+        wbuffs: [],          # 写前缓存 [ app_id, data ]
+        caches: [],          # 块读出缓存 [ app_id, data ]
+        chunks: [],          # 块队列 filename
+        spring: 0,           # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
+        p1_addr: nil,        # 远端地址
+        shadow_ids: {},      # shadow_id => app_id
+        apps: [],            # 开着的app
+        app_exts: {},        # 传输相关 app_id => {}
+        fin1s: [],           # fin1: app已关闭，等待对面收完流量 app_id
+        fin2s: [],           # fin2: 流量已收完 app_id
+        last_coming_at: nil, # 上一次来流量的时间
+        paused: false,       # 是否暂停写
+        resendings: []       # 重传队列 [ app_id, pack_id ]
       }
+
+      @p2 = p2
+      @p2_info = p2_info
+      @socks[ p2.object_id ] = p2
       @roles[ p2 ] = :p2
       @infos[ p2 ] = p2_info
-      @reads << p2
 
-      unless p2_info[ :wbuff ].empty?
-        @writes << p2
+      send_pack( p2, @title, @p2pd_sockaddr )
+      add_read( p2 )
+      check_reconn( p2 )
+      loop_expire( p2 )
+    end
+
+    def check_reconn( p2 )
+      Thread.new do
+        sleep RECONN_AFTER
+
+        unless p2.closed?
+          p2_info = @infos[ p2 ]
+
+          unless p2_info[ :p1_addr ]
+            @mutex.synchronize do
+              puts "reconn #{ Time.new }"
+              @ctlw.write( [ CTL_CLOSE_SOCK, [ p2.object_id ].pack( 'Q>' ) ].join )
+            end
+          end
+        end
+      end
+    end
+
+    def loop_expire( p2 )
+      Thread.new do
+        loop do
+          sleep CHECK_EXPIRE_INTERVAL
+
+          break if p2.closed?
+
+          p2_info = @infos[ p2 ]
+
+          if p2_info[ :last_coming_at ] && ( Time.new - p2_info[ :last_coming_at ] > EXPIRE_AFTER )
+            @mutex.synchronize do
+              puts "expire p2 #{ p2.object_id } #{ Time.new }"
+              @ctlw.write( [ CTL_CLOSE_SOCK, [ p2.object_id ].pack( 'Q>' ) ].join )
+            end
+          end
+        end
+      end
+    end
+
+    def loop_send_status( p2 )
+      Thread.new do
+        loop do
+          sleep STATUS_INTERVAL
+
+          if p2.closed?
+            # puts "debug p2 is closed, break send status loop #{ Time.new }"
+            break
+          end
+
+          p2_info = @infos[ p2 ]
+
+          if p2_info[ :app_exts ].any?
+            @mutex.synchronize do
+              now = Time.new
+
+              p2_info[ :app_exts ].each do | app_id, ext |
+                if ext[ :last_traffic_at ] && ( now - ext[ :last_traffic_at ] < SEND_STATUS_UNTIL )
+                  ctlmsg = [
+                    0,
+                    APP_STATUS,
+                    app_id,
+                    ext[ :biggest_pack_id ],
+                    ext[ :continue_shadow_pack_id ]
+                  ].pack( 'Q>CQ>Q>Q>' )
+
+                  send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+                end
+              end
+            end
+          end
+
+          if p2_info[ :paused ] && ( p2_info[ :app_exts ].map{ | _, ext | ext[ :wmems ].size }.sum < RESUME_BELOW )
+            @mutex.synchronize do
+              @ctlw.write( [ CTL_RESUME, [ p2.object_id ].pack( 'Q>' ) ].join )
+              p2_info[ :paused ] = false
+            end
+          end
+        end
+      end
+    end
+
+    def loop_send_fin1( p2, app_id )
+      Thread.new do
+        100.times do
+          break if p2.closed?
+
+          p2_info = @infos[ p2 ]
+
+          unless p2_info[ :fin1s ].include?( app_id )
+            # puts "debug break send fin1 loop #{ Time.new }"
+            break
+          end
+
+          @mutex.synchronize do
+            ctlmsg = [
+              0,
+              FIN1,
+              app_id
+            ].pack( 'Q>CQ>' )
+
+            # puts "debug send FIN1 #{ app_id } #{ Time.new }"
+            send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+          end
+
+          sleep 1
+        end
+      end
+    end
+
+    def loop_send_fin2( p2, app_id )
+      Thread.new do
+        100.times do
+          break if p2.closed?
+
+          p2_info = @infos[ p2 ]
+
+          unless p2_info[ :fin2s ].include?( app_id )
+            # puts "debug break send fin2 loop #{ Time.new }"
+            break
+          end
+
+          @mutex.synchronize do
+            ctlmsg = [
+              0,
+              FIN2,
+              app_id
+            ].pack( 'Q>CQ>' )
+
+            # puts "debug send FIN2 #{ app_id } #{ Time.new }"
+            send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+          end
+
+          sleep 1
+        end
+      end
+    end
+
+    def loop_send_a_new_app( app )
+      Thread.new do
+        100.times do
+          break if app.closed?
+
+          app_info = @infos[ app ]
+          p2 = app_info[ :p2 ]
+          break if p2.closed?
+
+          p2_info = @infos[ p2 ]
+
+          if p2_info[ :p1_addr ]
+            ext = p2_info[ :app_exts ][ app.object_id ]
+
+            if ext.nil? || ext[ :shadow_id ]
+              # puts "debug break a new app loop #{ Time.new }"
+              break
+            end
+
+            @mutex.synchronize do
+              ctlmsg = [ 0, A_NEW_APP, app.object_id ].pack( 'Q>CQ>' )
+              # puts "debug send a new app #{ Time.new }"
+              send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+            end
+          end
+
+          sleep 1
+        end
+      end
+    end
+
+    def send_pack( sock, data, target_sockaddr )
+      begin
+        sock.sendmsg( data, 0, target_sockaddr )
+      rescue IO::WaitWritable, Errno::EINTR => e
+        puts "sendmsg #{ e.class } #{ Time.new }"
+      end
+    end
+
+    def add_read( sock )
+      return if sock.closed? || @reads.include?( sock )
+
+      @reads << sock
+    end
+
+    def add_write( sock, data = nil )
+      return if sock.closed? || @writes.include?( sock )
+
+      @writes << sock
+    end
+
+    def add_closing( sock )
+      return if sock.closed? || @closings.include?( sock )
+
+      @reads.delete( sock )
+      @closings << sock
+      add_write( sock )
+    end
+
+    def close_p2( p2 )
+      info = close_sock( p2 )
+      info[ :apps ].each { | app | add_closing( app ) }
+    end
+
+    def close_app( app )
+      info = close_sock( app )
+      p2 = info[ :p2 ]
+      return if p2.closed?
+
+      p2_info = @infos[ p2 ]
+      p2_info[ :apps ].delete( app )
+      app_id = app.object_id
+      ext = p2_info[ :app_exts ][ app_id ]
+      return unless ext
+
+      if ext[ :is_shadow_closed ]
+        # puts "debug 2-3. app.close -> ext.is_shadow_closed ? yes -> del ext -> loop send fin2 #{ Time.new }"
+        p2_info[ :shadow_ids ].delete( ext[ :shadow_id ] )
+        p2_info[ :app_exts ].delete( app_id )
+
+        unless p2_info[ :fin2s ].include?( app_id )
+          p2_info[ :fin2s ] << app_id
+          loop_send_fin2( p2, app_id )
+        end
+      else
+        # puts "debug 1-1. app.close -> ext.is_shadow_closed ? no -> send fin1 loop #{ Time.new }"
+
+        if p2_info[ :p1_addr ] && !p2_info[ :fin1s ].include?( app_id )
+          p2_info[ :fin1s ] << app_id
+          loop_send_fin1( p2, app_id )
+        end
+      end
+    end
+
+    def close_sock( sock )
+      sock.close
+      @reads.delete( sock )
+      @writes.delete( sock )
+      @closings.delete( sock )
+      @socks.delete( sock.object_id )
+      role = @roles.delete( sock )
+      info = @infos.delete( sock )
+
+      if info
+        chunk_dir = ( role == :app ? @app_chunk_dir : @p2_chunk_dir )
+
+        info[ :chunks ].each do | filename |
+          begin
+            File.delete( File.join( chunk_dir, filename ) )
+          rescue Errno::ENOENT
+          end
+        end
       end
 
-      @app_info[ :p2 ] = p2
+      info
     end
+
   end
 end
