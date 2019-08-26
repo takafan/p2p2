@@ -104,8 +104,8 @@ module P2p2
     # read ctlr
     #
     def read_ctlr( ctlr )
-      case ctlr.read( 1 )
-      when CTL_CLOSE_SOCK
+      case ctlr.read( 1 ).unpack( 'C' ).first
+      when CTL_CLOSE
         sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
         sock = @socks[ sock_id ]
 
@@ -627,7 +627,7 @@ module P2p2
 
           if p2_info[ :p1_addr ].nil? || ( Time.new - p2_info[ :last_traffic_at ] > EXPIRE_AFTER )
             @mutex.synchronize do
-              @ctlw.write( [ CTL_CLOSE_SOCK, [ p2.object_id ].pack( 'Q>' ) ].join )
+              @ctlw.write( [ CTL_CLOSE, p2.object_id ].pack( 'CQ>' ) )
             end
           else
             @mutex.synchronize do
