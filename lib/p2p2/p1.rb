@@ -593,40 +593,26 @@ module P2p2
 
       send_pack( p1, @title, @p2pd_sockaddr )
       add_read( p1 )
-      check_reconn( p1 )
       loop_expire( p1 )
-    end
-
-    def check_reconn( p1 )
-      Thread.new do
-        sleep RECONN_AFTER
-
-        unless p1.closed?
-          p1_info = @infos[ p1 ]
-
-          unless p1_info[ :p2_addr ]
-            @mutex.synchronize do
-              puts "reconn #{ Time.new }"
-              @ctlw.write( [ CTL_CLOSE_SOCK, [ p1.object_id ].pack( 'Q>' ) ].join )
-            end
-          end
-        end
-      end
     end
 
     def loop_expire( p1 )
       Thread.new do
         loop do
-          sleep CHECK_EXPIRE_INTERVAL
+          sleep 30
 
           break if p1.closed?
 
           p1_info = @infos[ p1 ]
 
-          if p1_info[ :last_coming_at ] && ( Time.new - p1_info[ :last_coming_at ] > EXPIRE_AFTER )
+          if p1_info[ :p2_addr ].nil? || ( Time.new - p1_info[ :last_coming_at ] > EXPIRE_AFTER )
             @mutex.synchronize do
+              puts "expire p1 #{ p1.object_id } #{ Time.new }"
               @ctlw.write( [ CTL_CLOSE_SOCK, [ p1.object_id ].pack( 'Q>' ) ].join )
             end
+          else
+            ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+            send_pack( p1, ctlmsg, p1_info[ :p2_addr ] )
           end
         end
       end
