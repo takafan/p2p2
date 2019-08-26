@@ -20,6 +20,6 @@ module P2p2
   GOT_FIN2              = 11
   P1_FIN                = 12
   P2_FIN                = 13
-  CTL_CLOSE_SOCK        = [ 1 ].pack( 'C' )
-  CTL_RESUME            = [ 2 ].pack( 'C' )
+  CTL_CLOSE             = 1
+  CTL_RESUME            = 2
 end

@@ -110,16 +110,16 @@ module P2p2
         sock = @socks[ sock_id ]
 
         if sock
+          puts "ctlr close #{ sock_id } #{ Time.new }"
           add_closing( sock )
         end
       when CTL_RESUME
-        p2_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+        sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+        sock = @socks[ sock_id ]
 
-        puts "resume #{ p2_id } #{ Time.new }"
-        p2 = @socks[ p2_id ]
-
-        if p2
-          add_write( p2 )
+        if sock
+          puts "ctlr resume #{ sock_id } #{ Time.new }"
+          add_write( sock )
         end
       end
     end
@@ -354,7 +354,7 @@ module P2p2
           app_id = data[ 9, 8 ].unpack( 'Q>' ).first
           info[ :fin2s ].delete( app_id )
         when P1_FIN
-          raise "p1 fin #{ Time.new }"
+          raise "recv p1 fin #{ Time.new }"
         end
 
         return
@@ -615,7 +615,6 @@ module P2p2
 
           if p2_info[ :p1_addr ].nil? || ( Time.new - p2_info[ :last_coming_at ] > EXPIRE_AFTER )
             @mutex.synchronize do
-              puts "expire p2 #{ p2.object_id } #{ Time.new }"
               @ctlw.write( [ CTL_CLOSE_SOCK, [ p2.object_id ].pack( 'Q>' ) ].join )
             end
           else

@@ -101,23 +101,22 @@ module P2p2
     # read ctlr
     #
     def read_ctlr( ctlr )
-      case ctlr.read( 1 )
-      when CTL_CLOSE_SOCK
+      case ctlr.read( 1 ).unpack( 'C' ).first
+      when CTL_CLOSE
         sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
         sock = @socks[ sock_id ]
 
         if sock
-          puts "expire p1 #{ sock_id } #{ Time.new }"
+          puts "ctlr close #{ sock_id } #{ Time.new }"
           add_closing( sock )
         end
       when CTL_RESUME
-        p1_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+        sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
+        sock = @socks[ sock_id ]
 
-        puts "resume #{ p1_id } #{ Time.new }"
-        p1 = @socks[ p1_id ]
-
-        if p1
-          add_write( p1 )
+        if sock
+          puts "ctlr resume #{ sock_id } #{ Time.new }"
+          add_write( sock )
         end
       end
     end
@@ -356,7 +355,7 @@ module P2p2
           shadow_id = data[ 9, 8 ].unpack( 'Q>' ).first
           info[ :fin2s ].delete( shadow_id )
         when P2_FIN
-          puts "p2 fin #{ Time.new }"
+          puts "recv p2 fin #{ Time.new }"
           add_closing( p1 )
         end
 
@@ -607,8 +606,7 @@ module P2p2
 
           if p1_info[ :p2_addr ].nil? || ( Time.new - p1_info[ :last_coming_at ] > EXPIRE_AFTER )
             @mutex.synchronize do
-              puts "expire p1 #{ p1.object_id } #{ Time.new }"
-              @ctlw.write( [ CTL_CLOSE_SOCK, [ p1.object_id ].pack( 'Q>' ) ].join )
+              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
             end
           else
             ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
@@ -652,7 +650,7 @@ module P2p2
 
           if p1_info[ :paused ] && ( p1_info[ :shadow_exts ].map{ | _, ext | ext[ :wmems ].size }.sum < RESUME_BELOW )
             @mutex.synchronize do
-              @ctlw.write( [ CTL_RESUME, [ p1.object_id ].pack( 'Q>' ) ].join )
+              @ctlw.write( [ CTL_RESUME, p1.object_id ].pack( 'CQ>' ) )
               p1_info[ :paused ] = false
             end
           end
