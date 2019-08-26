@@ -674,7 +674,7 @@ module P2p2
 
           if p2_info[ :paused ] && ( p2_info[ :app_exts ].map{ | _, ext | ext[ :wmems ].size }.sum < RESUME_BELOW )
             @mutex.synchronize do
-              @ctlw.write( [ CTL_RESUME, [ p2.object_id ].pack( 'Q>' ) ].join )
+              @ctlw.write( [ CTL_RESUME, p2.object_id ].pack( 'CQ>' ) )
               p2_info[ :paused ] = false
             end
           end
