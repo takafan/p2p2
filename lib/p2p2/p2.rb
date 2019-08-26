@@ -43,7 +43,7 @@ module P2p2
       @closings = []
       @socks = {} # object_id => sock
       @roles = {} # sock => :ctlr / :appd / :app / :p2
-      @infos = {}
+      @infos = {} # sock => {}
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
@@ -110,7 +110,7 @@ module P2p2
         sock = @socks[ sock_id ]
 
         if sock
-          puts "ctlr close #{ sock_id } #{ Time.new }"
+          # puts "debug ctlr close #{ sock_id } #{ Time.new }"
           add_closing( sock )
         end
       when CTL_RESUME
@@ -139,16 +139,15 @@ module P2p2
       @socks[ app_id ] = app
       @roles[ app ] = :app
       @infos[ app ] = {
-        wbuff: '',  # 写前缓存
-        cache: '',  # 块读出缓存
-        chunks: [], # 块队列，写前达到块大小时结一个块 filename
-        spring: 0,  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         p2: @p2
       }
 
-      @p2_info[ :apps ] << app
       @p2_info[ :app_exts ][ app_id ] = {
         app: app,
+        wbuff: '',                  # 写前缓存
+        cache: '',                  # 块读出缓存
+        chunks: [],                 # 块队列，写前达到块大小时结一个块 filename
+        spring: 0,                  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         wmems: {},                  # 写后缓存 pack_id => data
         send_ats: {},               # 上一次发出时间 pack_id => send_at
         biggest_pack_id: 0,         # 发到几
@@ -158,7 +157,7 @@ module P2p2
         is_shadow_closed: false,    # 对面是否已关闭
         biggest_shadow_pack_id: 0,  # 对面发到几
         completed_pack_id: 0,       # 完成到几（对面收到几）
-        last_traffic_at: nil        # 有流量发出，或者有更新收到几，时间戳
+        last_traffic_at: nil        # 有收到有效流量，或者发出流量的时间戳
       }
 
       add_read( app )
@@ -209,25 +208,28 @@ module P2p2
     #
     def read_p2( p2 )
       data, addrinfo, rflags, *controls = p2.recvmsg
+      sockaddr = addrinfo.to_sockaddr
       now = Time.new
       info = @infos[ p2 ]
-      info[ :last_coming_at ] = now
       shadow_id = data[ 0, 8 ].unpack( 'Q>' ).first
 
       if shadow_id == 0
         case data[ 8 ].unpack( 'C' ).first
         when PEER_ADDR
-          return if addrinfo.to_sockaddr != @p2pd_sockaddr
+          return if sockaddr != @p2pd_sockaddr
 
           unless info[ :p1_addr ]
             # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
             info[ :p1_addr ] = data[ 9..-1 ]
+            info[ :last_traffic_at ] = now
             loop_send_status( p2 )
           end
 
           ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
           send_pack( p2, ctlmsg, info[ :p1_addr ] )
         when PAIRED
+          return if sockaddr != info[ :p1_addr ]
+
           app_id, shadow_id = data[ 9, 16 ].unpack( 'Q>Q>' )
           # puts "debug got PAIRED #{ app_id } #{ shadow_id } #{ Time.new }"
 
@@ -237,6 +239,8 @@ module P2p2
           ext[ :shadow_id ] = shadow_id
           info[ :shadow_ids ][ shadow_id ] = app_id
         when SHADOW_STATUS
+          return if sockaddr != info[ :p1_addr ]
+
           shadow_id, biggest_shadow_pack_id, continue_app_pack_id  = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
           app_id = info[ :shadow_ids ][ shadow_id ]
           return unless app_id
@@ -297,6 +301,8 @@ module P2p2
             end
           end
         when MISS
+          return if sockaddr != info[ :p1_addr ]
+
           app_id, pack_id_begin, pack_id_end = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
           ext = info[ :app_exts ][ app_id ]
           return unless ext
@@ -313,6 +319,8 @@ module P2p2
 
           add_write( p2 )
         when FIN1
+          return if sockaddr != info[ :p1_addr ]
+
           shadow_id = data[ 9, 8 ].unpack( 'Q>' ).first
           ctlmsg = [
             0,
@@ -331,10 +339,14 @@ module P2p2
 
           ext[ :is_shadow_closed ] = true
         when GOT_FIN1
+          return if sockaddr != info[ :p1_addr ]
+
           # puts "debug 1-2. recv got_fin1 -> break loop #{ Time.new }"
           app_id = data[ 9, 8 ].unpack( 'Q>' ).first
           info[ :fin1s ].delete( app_id )
         when FIN2
+          return if sockaddr != info[ :p1_addr ]
+
           # puts "debug 1-3. recv fin2 -> send got_fin2 -> del ext #{ Time.new }"
           shadow_id = data[ 9, 8 ].unpack( 'Q>' ).first
           ctlmsg = [
@@ -348,12 +360,15 @@ module P2p2
           app_id = info[ :shadow_ids ].delete( shadow_id )
           return unless app_id
 
-          info[ :app_exts ].delete( app_id )
+          del_app_ext( info, app_id )
         when GOT_FIN2
+          return if sockaddr != info[ :p1_addr ]
+
           # puts "debug 2-4. recv got_fin2 -> break loop #{ Time.new }"
           app_id = data[ 9, 8 ].unpack( 'Q>' ).first
           info[ :fin2s ].delete( app_id )
         when P1_FIN
+          return if sockaddr != info[ :p1_addr ]
           raise "recv p1 fin #{ Time.new }"
         end
 
@@ -384,22 +399,21 @@ module P2p2
         end
 
         ext[ :continue_shadow_pack_id ] = pack_id
-        ext[ :last_traffic_at ] = now
+        ext[ :wbuff ] << data
 
-        app_info = @infos[ ext[ :app ] ]
-        app_info[ :wbuff ] << data
-
-        if app_info[ :wbuff ].bytesize >= CHUNK_SIZE
-          spring = app_info[ :chunks ].size > 0 ? ( app_info[ :spring ] + 1 ) : 0
+        if ext[ :wbuff ].bytesize >= CHUNK_SIZE
+          spring = ext[ :chunks ].size > 0 ? ( ext[ :spring ] + 1 ) : 0
           filename = "#{ app_id }.#{ spring }"
           chunk_path = File.join( @app_chunk_dir, filename )
-          IO.binwrite( chunk_path, app_info[ :wbuff ] )
-          app_info[ :chunks ] << filename
-          app_info[ :spring ] = spring
-          app_info[ :wbuff ].clear
+          IO.binwrite( chunk_path, ext[ :wbuff ] )
+          ext[ :chunks ] << filename
+          ext[ :spring ] = spring
+          ext[ :wbuff ].clear
         end
 
         add_write( ext[ :app ] )
+        ext[ :last_traffic_at ] = now
+        info[ :last_traffic_at ] = now
       else
         ext[ :pieces ][ pack_id ] = data
       end
@@ -415,14 +429,23 @@ module P2p2
       end
 
       info = @infos[ app ]
+      p2 = info[ :p2 ]
+
+      if p2.closed?
+        add_closing( app )
+        return
+      end
+
+      p2_info = @infos[ p2 ]
+      ext = p2_info[ :app_exts ][ app.object_id ]
 
       # 取写前
-      data = info[ :cache ]
+      data = ext[ :cache ]
       from = :cache
 
       if data.empty?
-        if info[ :chunks ].any?
-          path = File.join( @app_chunk_dir, info[ :chunks ].shift )
+        if ext[ :chunks ].any?
+          path = File.join( @app_chunk_dir, ext[ :chunks ].shift )
 
           begin
             data = IO.binread( path )
@@ -432,22 +455,12 @@ module P2p2
             return
           end
         else
-          data = info[ :wbuff ]
+          data = ext[ :wbuff ]
           from = :wbuff
         end
       end
 
       if data.empty?
-        p2 = info[ :p2 ]
-
-        if p2.closed?
-          add_closing( app )
-          return
-        end
-
-        p2_info = @infos[ p2 ]
-        ext = p2_info[ :app_exts ][ app.object_id ]
-
         if ext[ :is_shadow_closed ] && ( ext[ :biggest_shadow_pack_id ] == ext[ :continue_shadow_pack_id ] )
           # puts "debug 2-2. all sent && ext.biggest_shadow_pack_id == ext.continue_shadow_pack_id -> add closing app #{ Time.new }"
           add_closing( app )
@@ -461,7 +474,7 @@ module P2p2
       begin
         written = app.write_nonblock( data )
       rescue IO::WaitWritable, Errno::EINTR => e
-        info[ from ] = data
+        ext[ from ] = data
         return
       rescue Exception => e
         add_closing( app )
@@ -469,7 +482,7 @@ module P2p2
       end
 
       data = data[ written..-1 ]
-      info[ from ] = data
+      ext[ from ] = data
     end
 
     ##
@@ -496,6 +509,7 @@ module P2p2
           if pack
             send_pack( p2, pack, info[ :p1_addr ] )
             ext[ :last_traffic_at ] = now
+            info[ :last_traffic_at ] = now
             return
           end
         end
@@ -558,6 +572,7 @@ module P2p2
         ext[ :wmems ][ pack_id ] = pack
         ext[ :send_ats ][ pack_id ] = now
         ext[ :last_traffic_at ] = now
+        info[ :last_traffic_at ] = now
       end
     end
 
@@ -584,13 +599,12 @@ module P2p2
         spring: 0,           # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         p1_addr: nil,        # 远端地址
         shadow_ids: {},      # shadow_id => app_id
-        apps: [],            # 开着的app
         app_exts: {},        # 传输相关 app_id => {}
         fin1s: [],           # fin1: app已关闭，等待对面收完流量 app_id
         fin2s: [],           # fin2: 流量已收完 app_id
-        last_coming_at: nil, # 上一次来流量的时间
         paused: false,       # 是否暂停写
-        resendings: []       # 重传队列 [ app_id, pack_id ]
+        resendings: [],      # 重传队列 [ app_id, pack_id ]
+        last_traffic_at: nil # 有收到有效流量，或者发出流量的时间戳
       }
 
       @p2 = p2
@@ -613,13 +627,15 @@ module P2p2
 
           p2_info = @infos[ p2 ]
 
-          if p2_info[ :p1_addr ].nil? || ( Time.new - p2_info[ :last_coming_at ] > EXPIRE_AFTER )
+          if p2_info[ :p1_addr ].nil? || ( Time.new - p2_info[ :last_traffic_at ] > EXPIRE_AFTER )
             @mutex.synchronize do
               @ctlw.write( [ CTL_CLOSE_SOCK, [ p2.object_id ].pack( 'Q>' ) ].join )
             end
           else
-            ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-            send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+            @mutex.synchronize do
+              ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+              send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+            end
           end
         end
       end
@@ -673,6 +689,7 @@ module P2p2
           break if p2.closed?
 
           p2_info = @infos[ p2 ]
+          break unless p2_info[ :p1_addr ]
 
           unless p2_info[ :fin1s ].include?( app_id )
             # puts "debug break send fin1 loop #{ Time.new }"
@@ -701,6 +718,7 @@ module P2p2
           break if p2.closed?
 
           p2_info = @infos[ p2 ]
+          break unless p2_info[ :p1_addr ]
 
           unless p2_info[ :fin2s ].include?( app_id )
             # puts "debug break send fin2 loop #{ Time.new }"
@@ -784,7 +802,15 @@ module P2p2
 
     def close_p2( p2 )
       info = close_sock( p2 )
-      info[ :apps ].each { | app | add_closing( app ) }
+
+      info[ :chunks ].each do | filename |
+        begin
+          File.delete( File.join( @p2_chunk_dir, filename ) )
+        rescue Errno::ENOENT
+        end
+      end
+
+      info[ :app_exts ].each{ | app_id, ext | add_closing( ext[ :app ] ) }
     end
 
     def close_app( app )
@@ -792,28 +818,30 @@ module P2p2
       p2 = info[ :p2 ]
       return if p2.closed?
 
-      p2_info = @infos[ p2 ]
-      p2_info[ :apps ].delete( app )
       app_id = app.object_id
+      p2_info = @infos[ p2 ]
       ext = p2_info[ :app_exts ][ app_id ]
       return unless ext
 
+      ext[ :chunks ].each do | filename |
+        begin
+          File.delete( File.join( @app_chunk_dir, filename ) )
+        rescue Errno::ENOENT
+        end
+      end
+
       if ext[ :is_shadow_closed ]
-        # puts "debug 2-3. app.close -> ext.is_shadow_closed ? yes -> del ext -> loop send fin2 #{ Time.new }"
-        p2_info[ :shadow_ids ].delete( ext[ :shadow_id ] )
-        p2_info[ :app_exts ].delete( app_id )
+        del_app_ext( p2_info, app_id )
 
         unless p2_info[ :fin2s ].include?( app_id )
+          # puts "debug 2-3. app.close -> ext.is_shadow_closed ? yes -> del ext -> loop send fin2 #{ Time.new }"
           p2_info[ :fin2s ] << app_id
           loop_send_fin2( p2, app_id )
         end
-      else
+      elsif !p2_info[ :fin1s ].include?( app_id )
         # puts "debug 1-1. app.close -> ext.is_shadow_closed ? no -> send fin1 loop #{ Time.new }"
-
-        if p2_info[ :p1_addr ] && !p2_info[ :fin1s ].include?( app_id )
-          p2_info[ :fin1s ] << app_id
-          loop_send_fin1( p2, app_id )
-        end
+        p2_info[ :fin1s ] << app_id
+        loop_send_fin1( p2, app_id )
       end
     end
 
@@ -823,21 +851,23 @@ module P2p2
       @writes.delete( sock )
       @closings.delete( sock )
       @socks.delete( sock.object_id )
-      role = @roles.delete( sock )
-      info = @infos.delete( sock )
+      @roles.delete( sock )
+      @infos.delete( sock )
+    end
 
-      if info
-        chunk_dir = ( role == :app ? @app_chunk_dir : @p2_chunk_dir )
+    def del_app_ext( p2_info, app_id )
+      ext = p2_info[ :app_exts ].delete( app_id )
 
-        info[ :chunks ].each do | filename |
+      if ext
+        p2_info[ :shadow_ids ].delete( ext[ :shadow_id ] )
+
+        ext[ :chunks ].each do | filename |
           begin
-            File.delete( File.join( chunk_dir, filename ) )
+            File.delete( File.join( @app_chunk_dir, filename ) )
           rescue Errno::ENOENT
           end
         end
       end
-
-      info
     end
 
   end
