@@ -198,7 +198,7 @@ module P2p2
         p2_info[ :wbuffs ].clear
       end
 
-      unless p2_info[ :paused ]
+      if p2_info[ :p1_addr ] && !p2_info[ :paused ]
         add_write( p2 )
       end
     end
