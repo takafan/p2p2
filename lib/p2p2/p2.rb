@@ -490,9 +490,7 @@ module P2p2
     #
     def write_p2( p2 )
       if @closings.include?( p2 )
-        close_p2( p2 )
-        new_p2
-        return
+        quit!
       end
 
       now = Time.new
@@ -798,19 +796,6 @@ module P2p2
       @reads.delete( sock )
       @closings << sock
       add_write( sock )
-    end
-
-    def close_p2( p2 )
-      info = close_sock( p2 )
-
-      info[ :chunks ].each do | filename |
-        begin
-          File.delete( File.join( @p2_chunk_dir, filename ) )
-        rescue Errno::ENOENT
-        end
-      end
-
-      info[ :app_exts ].each{ | app_id, ext | add_closing( ext[ :app ] ) }
     end
 
     def close_app( app )
