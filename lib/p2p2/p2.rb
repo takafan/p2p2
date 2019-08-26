@@ -222,6 +222,7 @@ module P2p2
             # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
             info[ :p1_addr ] = data[ 9..-1 ]
             info[ :last_traffic_at ] = now
+            add_write( p2 )
             loop_send_status( p2 )
           end
 

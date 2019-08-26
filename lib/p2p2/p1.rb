@@ -155,7 +155,7 @@ module P2p2
         p1_info[ :wbuffs ].clear
       end
 
-      unless p1_info[ :paused ]
+      if p1_info[ :p2_addr ] && !p1_info[ :paused ]
         add_write( p1 )
       end
     end
@@ -179,6 +179,7 @@ module P2p2
             # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
             info[ :p2_addr ] = data[ 9..-1 ]
             info[ :last_traffic_at ] = now
+            add_write( p1 )
             loop_send_status( p1 )
           end
 
