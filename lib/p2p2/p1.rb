@@ -48,7 +48,7 @@ module P2p2
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
       @roles[ ctlr ] = :ctlr
-      add_read( ctlr )
+      @reads << ctlr
     end
 
     def looping
@@ -155,7 +155,7 @@ module P2p2
         p1_info[ :wbuffs ].clear
       end
 
-      if p1_info[ :p2_addr ] && !p1_info[ :paused ]
+      unless p1_info[ :paused ]
         add_write( p1 )
       end
     end
@@ -176,15 +176,12 @@ module P2p2
           return if sockaddr != @p2pd_sockaddr
 
           unless info[ :p2_addr ]
-            # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
             info[ :p2_addr ] = data[ 9..-1 ]
+            # puts "debug peer addr #{ Addrinfo.new( info[ :p2_addr ] ).ip_unpack.inspect } #{ Time.new }"
             info[ :last_traffic_at ] = now
-            add_write( p1 )
+            send_heartbeat( p1 )
             loop_send_status( p1 )
           end
-
-          ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-          send_pack( p1, ctlmsg, info[ :p2_addr ] )
         when A_NEW_APP
           return if sockaddr != info[ :p2_addr ]
 
@@ -219,12 +216,13 @@ module P2p2
               biggest_pack_id: 0,      # 发到几
               continue_app_pack_id: 0, # 收到几
               pieces: {},              # 跳号包 app_pack_id => data
-              app_id: app_id,          # 对面id
               is_app_closed: false,    # 对面是否已关闭
               biggest_app_pack_id: 0,  # 对面发到几
               completed_pack_id: 0,    # 完成到几（对面收到几）
-              last_traffic_at: nil     # 有收到有效流量，或者发出流量的时间戳
+              last_traffic_at: nil     # 收到有效流量，或者发出流量的时间戳
             }
+
+            info[ :shadow_ids ][ shadow_id ] = app_id
             info[ :app_ids ][ app_id ] = shadow_id
             add_read( shadow )
           end
@@ -357,7 +355,7 @@ module P2p2
 
           send_pack( p1, ctlmsg, info[ :p2_addr ] )
 
-          shadow_id = info[ :app_ids ].delete( app_id )
+          shadow_id = info[ :app_ids ][ app_id ]
           return unless shadow_id
 
           del_shadow_ext( info, shadow_id )
@@ -376,6 +374,8 @@ module P2p2
 
         return
       end
+
+      return if sockaddr != info[ :p2_addr ]
 
       shadow_id = info[ :app_ids ][ app_id ]
       return unless shadow_id
@@ -589,13 +589,14 @@ module P2p2
         chunks: [],          # 块队列 filename
         spring: 0,           # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         p2_addr: nil,        # 远端地址
-        app_ids: {},         # app_id => shadow_id
         shadow_exts: {},     # 长命信息 shadow_id => {}
+        shadow_ids: {},      # shadow_id => app_id
+        app_ids: {},         # app_id => shadow_id
         fin1s: [],           # fin1: shadow已关闭，等待对面收完流量 shadow_id
         fin2s: [],           # fin2: 流量已收完 shadow_id
         paused: false,       # 是否暂停写
         resendings: [],      # 重传队列 [ shadow_id, pack_id ]
-        last_traffic_at: nil # 有收到有效流量，或者发出流量的时间戳
+        last_traffic_at: nil # 收到有效流量，或者发出流量的时间戳
       }
 
       @p1 = p1
@@ -624,8 +625,7 @@ module P2p2
             end
           else
             @mutex.synchronize do
-              ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-              send_pack( p1, ctlmsg, p1_info[ :p2_addr ] )
+              send_heartbeat( p1 )
             end
           end
         end
@@ -732,6 +732,12 @@ module P2p2
       end
     end
 
+    def send_heartbeat( p1 )
+      info = @infos[ p1 ]
+      ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+      send_pack( p1, ctlmsg, info[ :p2_addr ] )
+    end
+
     def send_pack( sock, data, target_sockaddr )
       begin
         sock.sendmsg( data, 0, target_sockaddr )
@@ -812,14 +818,18 @@ module P2p2
       ext = p1_info[ :shadow_exts ].delete( shadow_id )
 
       if ext
-        p1_info[ :app_ids ].delete( ext[ :app_id ] )
-
         ext[ :chunks ].each do | filename |
           begin
             File.delete( File.join( @shadow_chunk_dir, filename ) )
           rescue Errno::ENOENT
           end
         end
+      end
+
+      app_id = p1_info[ :shadow_ids ].delete( shadow_id )
+
+      if app_id
+        p1_info[ :app_ids ].delete( app_id )
       end
     end
 

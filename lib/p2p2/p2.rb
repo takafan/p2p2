@@ -48,7 +48,7 @@ module P2p2
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
       @roles[ ctlr ] = :ctlr
-      add_read( ctlr )
+      @reads << ctlr
     end
 
     def looping
@@ -142,6 +142,7 @@ module P2p2
         p2: @p2
       }
 
+      @p2_info[ :waitings ][ app_id ] = []
       @p2_info[ :app_exts ][ app_id ] = {
         app: app,
         wbuff: '',                  # 写前缓存
@@ -153,11 +154,10 @@ module P2p2
         biggest_pack_id: 0,         # 发到几
         continue_shadow_pack_id: 0, # 收到几
         pieces: {},                 # 跳号包 shadow_pack_id => data
-        shadow_id: nil,             # 对面id
         is_shadow_closed: false,    # 对面是否已关闭
         biggest_shadow_pack_id: 0,  # 对面发到几
         completed_pack_id: 0,       # 完成到几（对面收到几）
-        last_traffic_at: nil        # 有收到有效流量，或者发出流量的时间戳
+        last_traffic_at: nil        # 收到有效流量，或者发出流量的时间戳
       }
 
       add_read( app )
@@ -185,8 +185,16 @@ module P2p2
         return
       end
 
+      app_id = app.object_id
       p2_info = @infos[ p2 ]
-      p2_info[ :wbuffs ] << [ app.object_id, data ]
+      shadow_id = p2_info[ :app_ids ][ app_id ]
+
+      if p2_info[ :p1_addr ].nil? || shadow_id.nil?
+        p2_info[ :waitings ][ app_id ] << data
+        return
+      end
+
+      p2_info[ :wbuffs ] << [ app_id, data ]
 
       if p2_info[ :wbuffs ].size >= WBUFFS_LIMIT
         spring = p2_info[ :chunks ].size > 0 ? ( p2_info[ :spring ] + 1 ) : 0
@@ -198,10 +206,12 @@ module P2p2
         p2_info[ :wbuffs ].clear
       end
 
-      if p2_info[ :p1_addr ] && !p2_info[ :paused ]
+      unless p2_info[ :paused ]
         add_write( p2 )
       end
     end
+
+
 
     ##
     # read p2
@@ -219,26 +229,33 @@ module P2p2
           return if sockaddr != @p2pd_sockaddr
 
           unless info[ :p1_addr ]
-            # puts "debug peer addr #{ data[ 9..-1 ].inspect } #{ Time.new }"
             info[ :p1_addr ] = data[ 9..-1 ]
+            # puts "debug peer addr #{ Addrinfo.new( info[ :p1_addr ] ).ip_unpack.inspect } #{ Time.new }"
             info[ :last_traffic_at ] = now
-            add_write( p2 )
+            send_heartbeat( p2 )
             loop_send_status( p2 )
           end
-
-          ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-          send_pack( p2, ctlmsg, info[ :p1_addr ] )
         when PAIRED
           return if sockaddr != info[ :p1_addr ]
 
           app_id, shadow_id = data[ 9, 16 ].unpack( 'Q>Q>' )
+          return if info[ :app_ids ].include?( app_id )
+
           # puts "debug got PAIRED #{ app_id } #{ shadow_id } #{ Time.new }"
-
-          ext = info[ :app_exts ][ app_id ]
-          return if ext.nil? || ext[ :shadow_id ]
-
-          ext[ :shadow_id ] = shadow_id
+          info[ :app_ids ][ app_id ] = shadow_id
           info[ :shadow_ids ][ shadow_id ] = app_id
+          buffs = info[ :waitings ][ app_id ]
+
+          if buffs.any?
+            # puts "debug move #{ buffs.size } waiting buffs to wbuffs #{ Time.new } p#{ Process.pid }"
+
+            buffs.each do | buff |
+              info[ :wbuffs ] << [ app_id, buff ]
+            end
+
+            buffs.clear
+            add_write( p2 )
+          end
         when SHADOW_STATUS
           return if sockaddr != info[ :p1_addr ]
 
@@ -358,7 +375,7 @@ module P2p2
 
           send_pack( p2, ctlmsg, info[ :p1_addr ] )
 
-          app_id = info[ :shadow_ids ].delete( shadow_id )
+          app_id = info[ :shadow_ids ][ shadow_id ]
           return unless app_id
 
           del_app_ext( info, app_id )
@@ -375,6 +392,8 @@ module P2p2
 
         return
       end
+
+      return if sockaddr != info[ :p1_addr ]
 
       app_id = info[ :shadow_ids ][ shadow_id ]
       return unless app_id
@@ -592,18 +611,20 @@ module P2p2
       p2.bind( Socket.sockaddr_in( 0, '0.0.0.0' ) )
 
       p2_info = {
+        waitings: {},        # 还没连上p1，或者还没配上shadow，暂存流量 app_id => buffs[]
         wbuffs: [],          # 写前缓存 [ app_id, data ]
         caches: [],          # 块读出缓存 [ app_id, data ]
         chunks: [],          # 块队列 filename
         spring: 0,           # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         p1_addr: nil,        # 远端地址
-        shadow_ids: {},      # shadow_id => app_id
         app_exts: {},        # 传输相关 app_id => {}
+        app_ids: {},         # app_id => shadow_id
+        shadow_ids: {},      # shadow_id => app_id
         fin1s: [],           # fin1: app已关闭，等待对面收完流量 app_id
         fin2s: [],           # fin2: 流量已收完 app_id
         paused: false,       # 是否暂停写
         resendings: [],      # 重传队列 [ app_id, pack_id ]
-        last_traffic_at: nil # 有收到有效流量，或者发出流量的时间戳
+        last_traffic_at: nil # 收到有效流量，或者发出流量的时间戳
       }
 
       @p2 = p2
@@ -632,8 +653,7 @@ module P2p2
             end
           else
             @mutex.synchronize do
-              ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-              send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
+              send_heartbeat( p2 )
             end
           end
         end
@@ -752,15 +772,16 @@ module P2p2
           p2_info = @infos[ p2 ]
 
           if p2_info[ :p1_addr ]
-            ext = p2_info[ :app_exts ][ app.object_id ]
+            app_id = app.object_id
+            shadow_id = p2_info[ :app_ids ][ app_id ]
 
-            if ext.nil? || ext[ :shadow_id ]
+            if shadow_id
               # puts "debug break a new app loop #{ Time.new }"
               break
             end
 
             @mutex.synchronize do
-              ctlmsg = [ 0, A_NEW_APP, app.object_id ].pack( 'Q>CQ>' )
+              ctlmsg = [ 0, A_NEW_APP, app_id ].pack( 'Q>CQ>' )
               # puts "debug send a new app #{ Time.new }"
               send_pack( p2, ctlmsg, p2_info[ :p1_addr ] )
             end
@@ -769,6 +790,12 @@ module P2p2
           sleep 1
         end
       end
+    end
+
+    def send_heartbeat( p2 )
+      info = @infos[ p2 ]
+      ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+      send_pack( p2, ctlmsg, info[ :p1_addr ] )
     end
 
     def send_pack( sock, data, target_sockaddr )
@@ -842,17 +869,22 @@ module P2p2
     end
 
     def del_app_ext( p2_info, app_id )
+      p2_info[ :waitings ].delete( app_id )
       ext = p2_info[ :app_exts ].delete( app_id )
 
       if ext
-        p2_info[ :shadow_ids ].delete( ext[ :shadow_id ] )
-
         ext[ :chunks ].each do | filename |
           begin
             File.delete( File.join( @app_chunk_dir, filename ) )
           rescue Errno::ENOENT
           end
         end
+      end
+
+      shadow_id = p2_info[ :app_ids ].delete( app_id )
+
+      if shadow_id
+        p2_info[ :shadow_ids ].delete( shadow_id )
       end
     end
 
