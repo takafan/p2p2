@@ -186,6 +186,7 @@ module P2p2
           # puts "debug p2 addr #{ Addrinfo.new( info[ :p2_addr ] ).ip_unpack.inspect } #{ Time.new }"
           info[ :last_traffic_at ] = now
           loop_send_status( p1 )
+          loop_expire( p1 )
         when A_NEW_APP
           return if sockaddr != info[ :p2_addr ]
 
@@ -612,26 +613,36 @@ module P2p2
 
       send_pack( p1, @title, @p2pd_sockaddr )
       add_read( p1 )
-      loop_expire( p1 )
+      loop_send_char( p1 )
     end
 
-    def loop_expire( p1 )
+    def loop_send_char( p1 )
       Thread.new do
-        loop do
-          sleep 60
+        is_timeout = true
 
-          break if p1.closed?
+        12.times do
+          sleep 5
+
+          if p1.closed?
+            is_timeout = false
+            break
+          end
 
           p1_info = @infos[ p1 ]
 
-          if p1_info[ :p2_addr ].nil? || ( Time.new - p1_info[ :last_traffic_at ] > EXPIRE_AFTER )
-            @mutex.synchronize do
-              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
-            end
-          else
-            @mutex.synchronize do
-              send_heartbeat( p1, p1_info[ :p2_addr ] )
-            end
+          if p1_info[ :peer_addr ]
+            is_timeout = false
+            break
+          end
+
+          @mutex.synchronize do
+            send_pack( p1, [ rand( 128 ) ].pack( 'C' ), @p2pd_sockaddr )
+          end
+        end
+
+        if is_timeout
+          @mutex.synchronize do
+            @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
           end
         end
       end
@@ -639,7 +650,7 @@ module P2p2
 
     def loop_send_heartbeat( p1 )
       Thread.new do
-        30.times do
+        20.times do
           break if p1.closed?
 
           p1_info = @infos[ p1 ]
@@ -649,6 +660,35 @@ module P2p2
           end
 
           sleep STATUS_INTERVAL
+        end
+
+        if !p1.closed?
+          p1_info = @infos[ p1 ]
+
+          unless p1_info[ :p2_addr ]
+            @mutex.synchronize do
+              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
+            end
+          end
+        end
+      end
+    end
+
+    def loop_expire( p1 )
+      Thread.new do
+        loop do
+          sleep 5
+          break if p1.closed?
+
+          p1_info = @infos[ p1 ]
+
+          @mutex.synchronize do
+            if Time.new - p1_info[ :last_traffic_at ] > EXPIRE_AFTER
+              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
+            else
+              send_heartbeat( p1, p1_info[ :p2_addr ] )
+            end
+          end
         end
       end
     end
