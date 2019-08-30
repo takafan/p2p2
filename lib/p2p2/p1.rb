@@ -173,15 +173,19 @@ module P2p2
       if app_id == 0
         case data[ 8 ].unpack( 'C' ).first
         when PEER_ADDR
-          return if sockaddr != @p2pd_sockaddr
+          return if info[ :peer_addr ] || ( sockaddr != @p2pd_sockaddr )
 
-          unless info[ :p2_addr ]
-            info[ :p2_addr ] = data[ 9..-1 ]
-            # puts "debug peer addr #{ Addrinfo.new( info[ :p2_addr ] ).ip_unpack.inspect } #{ Time.new }"
-            info[ :last_traffic_at ] = now
-            send_heartbeat( p1 )
-            loop_send_status( p1 )
-          end
+          peer_addr = data[ 9..-1 ]
+          info[ :peer_addr ] = data[ 9..-1 ]
+          # puts "debug peer addr #{ Addrinfo.new( info[ :peer_addr ] ).ip_unpack.inspect } #{ Time.new }"
+          loop_send_heartbeat( p1 )
+        when HEARTBEAT
+          return if info[ :p2_addr ] || ( sockaddr != info[ :peer_addr ] )
+
+          info[ :p2_addr ] = sockaddr
+          # puts "debug p2 addr #{ Addrinfo.new( info[ :p2_addr ] ).ip_unpack.inspect } #{ Time.new }"
+          info[ :last_traffic_at ] = now
+          loop_send_status( p1 )
         when A_NEW_APP
           return if sockaddr != info[ :p2_addr ]
 
@@ -588,7 +592,8 @@ module P2p2
         caches: [],          # 块读出缓存 [ shadow_id, data ]
         chunks: [],          # 块队列 filename
         spring: 0,           # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-        p2_addr: nil,        # 远端地址
+        peer_addr: nil,      # 对面地址，连发心跳包打洞，离p2pd近的一方通常会撞死几个直到对面出来
+        p2_addr: nil,        # p2地址
         shadow_exts: {},     # 长命信息 shadow_id => {}
         shadow_ids: {},      # shadow_id => app_id
         app_ids: {},         # app_id => shadow_id
@@ -613,7 +618,7 @@ module P2p2
     def loop_expire( p1 )
       Thread.new do
         loop do
-          sleep 30
+          sleep 60
 
           break if p1.closed?
 
@@ -625,9 +630,25 @@ module P2p2
             end
           else
             @mutex.synchronize do
-              send_heartbeat( p1 )
+              send_heartbeat( p1, p1_info[ :p2_addr ] )
             end
           end
+        end
+      end
+    end
+
+    def loop_send_heartbeat( p1 )
+      Thread.new do
+        30.times do
+          break if p1.closed?
+
+          p1_info = @infos[ p1 ]
+
+          @mutex.synchronize do
+            send_heartbeat( p1, p1_info[ :peer_addr ] )
+          end
+
+          sleep STATUS_INTERVAL
         end
       end
     end
@@ -732,10 +753,9 @@ module P2p2
       end
     end
 
-    def send_heartbeat( p1 )
-      info = @infos[ p1 ]
+    def send_heartbeat( p1, target_addr )
       ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-      send_pack( p1, ctlmsg, info[ :p2_addr ] )
+      send_pack( p1, ctlmsg, target_addr )
     end
 
     def send_pack( sock, data, target_sockaddr )
