@@ -88,7 +88,7 @@ module P2p2
 
     def read_p2pd( p2pd )
       data, addrinfo, rflags, *controls = p2pd.recvmsg
-      return if data.size > 255
+      return if ( data.bytesize > 255 ) || ( data =~ /\/|\.|\ / )
 
       sockaddr = addrinfo.to_sockaddr
       title_path = File.join( @p2pd_dir, data )
@@ -118,7 +118,7 @@ module P2p2
       begin
         # puts "debug write title #{ title_path } #{ Time.new }"
         IO.binwrite( title_path, sockaddr )
-      rescue Errno::ENOENT, ArgumentError => e
+      rescue Errno::EISDIR, Errno::ENAMETOOLONG, Errno::ENOENT, ArgumentError => e
         puts "binwrite #{ e.class } #{ Time.new }"
       end
     end

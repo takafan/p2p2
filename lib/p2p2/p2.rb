@@ -55,7 +55,6 @@ module P2p2
       puts 'looping'
 
       new_appd
-      new_p2
 
       loop do
         rs, ws = IO.select( @reads, @writes )
@@ -132,6 +131,10 @@ module P2p2
         app, _ = appd.accept_nonblock
       rescue IO::WaitReadable, Errno::EINTR
         return
+      end
+
+      if @p2.nil? || @p2.closed?
+        new_p2
       end
 
       app_id = app.object_id
@@ -388,7 +391,8 @@ module P2p2
           info[ :fin2s ].delete( app_id )
         when P1_FIN
           return if sockaddr != info[ :p1_addr ]
-          raise "recv p1 fin #{ Time.new }"
+          puts "recv p1 fin #{ Time.new }"
+          add_closing( p2 )
         end
 
         return
@@ -511,7 +515,8 @@ module P2p2
     #
     def write_p2( p2 )
       if @closings.include?( p2 )
-        quit!
+        close_p2( p2 )
+        return
       end
 
       now = Time.new
@@ -841,6 +846,19 @@ module P2p2
       @reads.delete( sock )
       @closings << sock
       add_write( sock )
+    end
+
+    def close_p2( p2 )
+      info = close_sock( p2 )
+
+      info[ :chunks ].each do | filename |
+        begin
+          File.delete( File.join( @p2_chunk_dir, filename ) )
+        rescue Errno::ENOENT
+        end
+      end
+
+      info[ :app_exts ].each{ | _, ext | add_closing( ext[ :app ] ) }
     end
 
     def close_app( app )
