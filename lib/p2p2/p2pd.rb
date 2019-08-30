@@ -95,11 +95,13 @@ module P2p2
 
       unless File.exist?( title_path )
         write_title( title_path, sockaddr )
+        send_heartbeat( p2pd, sockaddr )
         return
       end
 
       if Time.new - File.mtime( title_path ) > 300
         write_title( title_path, sockaddr )
+        send_heartbeat( p2pd, sockaddr )
         return
       end
 
@@ -107,6 +109,7 @@ module P2p2
 
       if Addrinfo.new( op_sockaddr ).ip_address == addrinfo.ip_address
         write_title( title_path, sockaddr )
+        send_heartbeat( p2pd, sockaddr )
         return
       end
 
@@ -121,6 +124,11 @@ module P2p2
       rescue Errno::EISDIR, Errno::ENAMETOOLONG, Errno::ENOENT, ArgumentError => e
         puts "binwrite #{ e.class } #{ Time.new }"
       end
+    end
+
+    def send_heartbeat( p2pd, target_addr )
+      ctlmsg = [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
+      send_pack( p2pd, ctlmsg, target_addr )
     end
 
     def send_pack( sock, data, target_sockaddr )
