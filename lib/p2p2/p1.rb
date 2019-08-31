@@ -178,15 +178,15 @@ module P2p2
           peer_addr = data[ 9..-1 ]
           info[ :peer_addr ] = data[ 9..-1 ]
           # puts "debug peer addr #{ Addrinfo.new( info[ :peer_addr ] ).ip_unpack.inspect } #{ Time.new }"
-          loop_send_heartbeat( p1 )
+          loop_punch_peer( p1 )
         when HEARTBEAT
           return if info[ :p2_addr ] || ( sockaddr != info[ :peer_addr ] )
 
           info[ :p2_addr ] = sockaddr
           # puts "debug p2 addr #{ Addrinfo.new( info[ :p2_addr ] ).ip_unpack.inspect } #{ Time.new }"
           info[ :last_traffic_at ] = now
+          loop_send_heartbeat( p1 )
           loop_send_status( p1 )
-          loop_expire( p1 )
         when A_NEW_APP
           return if sockaddr != info[ :p2_addr ]
 
@@ -621,7 +621,7 @@ module P2p2
         is_timeout = true
 
         12.times do
-          sleep 5
+          sleep HEARTBEAT_INTERVAL
 
           if p1.closed?
             is_timeout = false
@@ -648,7 +648,7 @@ module P2p2
       end
     end
 
-    def loop_send_heartbeat( p1 )
+    def loop_punch_peer( p1 )
       Thread.new do
         20.times do
           break if p1.closed?
@@ -674,20 +674,24 @@ module P2p2
       end
     end
 
-    def loop_expire( p1 )
+    def loop_send_heartbeat( p1 )
       Thread.new do
         loop do
-          sleep 5
+          sleep HEARTBEAT_INTERVAL
           break if p1.closed?
 
           p1_info = @infos[ p1 ]
 
-          @mutex.synchronize do
-            if Time.new - p1_info[ :last_traffic_at ] > EXPIRE_AFTER
+          if Time.new - p1_info[ :last_traffic_at ] > EXPIRE_AFTER
+            @mutex.synchronize do
               @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
-            else
-              send_heartbeat( p1, p1_info[ :p2_addr ] )
             end
+            
+            return
+          end
+
+          @mutex.synchronize do
+            send_heartbeat( p1, p1_info[ :p2_addr ] )
           end
         end
       end
