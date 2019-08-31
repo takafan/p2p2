@@ -620,7 +620,7 @@ module P2p2
       Thread.new do
         is_timeout = true
 
-        12.times do
+        20.times do
           sleep HEARTBEAT_INTERVAL
 
           if p1.closed?
@@ -686,7 +686,7 @@ module P2p2
             @mutex.synchronize do
               @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
             end
-            
+
             return
           end
 

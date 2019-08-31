@@ -650,7 +650,7 @@ module P2p2
       Thread.new do
         is_timeout = true
 
-        12.times do
+        20.times do
           sleep HEARTBEAT_INTERVAL
 
           if p2.closed?
