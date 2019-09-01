@@ -109,7 +109,6 @@ module P2p2
         sock = @socks[ sock_id ]
 
         if sock
-          # puts "debug ctlr close #{ sock_id } #{ Time.new }"
           add_closing( sock )
         end
       when CTL_RESUME
@@ -117,7 +116,6 @@ module P2p2
         sock = @socks[ sock_id ]
 
         if sock
-          puts "ctlr resume #{ sock_id } #{ Time.new }"
           add_write( sock )
         end
       end
@@ -148,6 +146,8 @@ module P2p2
       @p2_info[ :waitings ][ app_id ] = []
       @p2_info[ :app_exts ][ app_id ] = {
         app: app,
+        created_at: Time.new,
+        last_recv_at: nil,          # 上一次收到流量的时间
         wbuff: '',                  # 写前缓存
         cache: '',                  # 块读出缓存
         chunks: [],                 # 块队列，写前达到块大小时结一个块 filename
@@ -239,6 +239,7 @@ module P2p2
           # puts "debug p1 addr #{ Addrinfo.new( info[ :p1_addr ] ).ip_unpack.inspect } #{ Time.new }"
           info[ :last_traffic_at ] = now
           loop_send_heartbeat( p2 )
+          loop_check_expire( p2 )
           loop_send_status( p2 )
         when PAIRED
           return if sockaddr != info[ :p1_addr ]
@@ -443,6 +444,8 @@ module P2p2
       else
         ext[ :pieces ][ pack_id ] = data
       end
+
+      ext[ :last_recv_at ] = now
     end
 
     ##
@@ -710,18 +713,43 @@ module P2p2
           sleep HEARTBEAT_INTERVAL
           break if p2.closed?
 
+          @mutex.synchronize do
+            p2_info = @infos[ p2 ]
+            send_heartbeat( p2, p2_info[ :p1_addr ] )
+          end
+        end
+      end
+    end
+
+    def loop_check_expire( p2 )
+      Thread.new do
+        loop do
+          sleep 60
+          break if p2.closed?
+
+          now = Time.new
           p2_info = @infos[ p2 ]
 
-          if Time.new - p2_info[ :last_traffic_at ] > EXPIRE_AFTER
+          if now - p2_info[ :last_traffic_at ] > EXPIRE_AFTER
             @mutex.synchronize do
+              # puts "debug ctlw close p2 #{ p2.object_id } #{ Time.new } p#{ Process.pid }"
               @ctlw.write( [ CTL_CLOSE, p2.object_id ].pack( 'CQ>' ) )
             end
 
             break
           end
 
-          @mutex.synchronize do
-            send_heartbeat( p2, p2_info[ :p1_addr ] )
+          exts = p2_info[ :app_exts ].select{ | _, ext | now - ext[ :created_at ] > 5 }
+
+          if exts.any?
+            @mutex.synchronize do
+              exts.each do | app_id, ext |
+                if ext[ :last_recv_at ].nil? || ( now - ext[ :last_recv_at ] > EXPIRE_AFTER )
+                  # puts "debug ctlw close app #{ app_id } #{ Time.new } p#{ Process.pid }"
+                  @ctlw.write( [ CTL_CLOSE, app_id ].pack( 'CQ>' ) )
+                end
+              end
+            end
           end
         end
       end
@@ -761,6 +789,7 @@ module P2p2
 
           if p2_info[ :paused ] && ( p2_info[ :app_exts ].map{ | _, ext | ext[ :wmems ].size }.sum < RESUME_BELOW )
             @mutex.synchronize do
+              puts "ctlw resume #{ p2.object_id } #{ Time.new }"
               @ctlw.write( [ CTL_RESUME, p2.object_id ].pack( 'CQ>' ) )
               p2_info[ :paused ] = false
             end
