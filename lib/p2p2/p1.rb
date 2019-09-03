@@ -41,9 +41,10 @@ module P2p2
       @reads = []
       @writes = []
       @closings = []
-      @socks = {} # object_id => sock
       @roles = {} # sock => :ctlr / :shadow / :p1
       @infos = {} # sock => {}
+      @socks = {} # sock => sock_id
+      @sock_ids = {} # sock_id => sock
 
       ctlr, ctlw = IO.pipe
       @ctlw = ctlw
@@ -104,14 +105,14 @@ module P2p2
       case ctlr.read( 1 ).unpack( 'C' ).first
       when CTL_CLOSE
         sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
-        sock = @socks[ sock_id ]
+        sock = @sock_ids[ sock_id ]
 
         if sock
           add_closing( sock )
         end
       when CTL_RESUME
         sock_id = ctlr.read( 8 ).unpack( 'Q>' ).first
-        sock = @socks[ sock_id ]
+        sock = @sock_ids[ sock_id ]
 
         if sock
           add_write( sock )
@@ -141,11 +142,13 @@ module P2p2
       end
 
       p1_info = @infos[ p1 ]
-      p1_info[ :wbuffs ] << [ shadow.object_id, data ]
+      shadow_id = @socks[ shadow ]
+      p1_info[ :wbuffs ] << [ shadow_id, data ]
 
       if p1_info[ :wbuffs ].size >= WBUFFS_LIMIT
+        p1_id = @socks[ p1 ]
         spring = p1_info[ :chunks ].size > 0 ? ( p1_info[ :spring ] + 1 ) : 0
-        filename = "#{ p1.object_id }.#{ spring }"
+        filename = "#{ p1_id }.#{ spring }"
         chunk_path = File.join( @p1_chunk_dir, filename )
         IO.binwrite( chunk_path, p1_info[ :wbuffs ].map{ | shadow_id, data | "#{ [ shadow_id, data.bytesize ].pack( 'Q>n' ) }#{ data }" }.join )
         p1_info[ :chunks ] << filename
@@ -201,13 +204,14 @@ module P2p2
             rescue IO::WaitWritable, Errno::EINTR
             end
 
-            shadow_id = shadow.object_id
-
-            @socks[ shadow_id ] = shadow
+            shadow_id = @hex.gen_random_num
             @roles[ shadow ] = :shadow
             @infos[ shadow ] = {
+              id: shadow_id,
               p1: p1
             }
+            @socks[ shadow ] = shadow_id
+            @sock_ids[ shadow_id ] = shadow
 
             info[ :shadow_exts ][ shadow_id ] = {
               shadow: shadow,
@@ -447,7 +451,8 @@ module P2p2
       end
 
       p1_info = @infos[ p1 ]
-      ext = p1_info[ :shadow_exts ][ shadow.object_id ]
+      shadow_id = @socks[ shadow ]
+      ext = p1_info[ :shadow_exts ][ shadow_id ]
 
       # 取写前
       data = ext[ :cache ]
@@ -591,7 +596,9 @@ module P2p2
       p1.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
       p1.bind( Socket.sockaddr_in( 0, '0.0.0.0' ) )
 
+      p1_id = @hex.gen_random_num
       p1_info = {
+        id: p1_id,
         wbuffs: [],          # 写前缓存 [ shadow_id, data ]
         caches: [],          # 块读出缓存 [ shadow_id, data ]
         chunks: [],          # 块队列 filename
@@ -610,9 +617,10 @@ module P2p2
 
       @p1 = p1
       @p1_info = p1_info
-      @socks[ p1.object_id ] = p1
       @roles[ p1 ] = :p1
       @infos[ p1 ] = p1_info
+      @socks[ p1 ] = p1_id
+      @sock_ids[ p1_id ] = p1
 
       send_pack( p1, @title, @p2pd_sockaddr )
       add_read( p1 )
@@ -645,7 +653,8 @@ module P2p2
 
         if is_timeout
           @mutex.synchronize do
-            @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
+            p1_id = @socks[ p1 ]
+            @ctlw.write( [ CTL_CLOSE, p1_id ].pack( 'CQ>' ) )
           end
         end
       end
@@ -670,7 +679,8 @@ module P2p2
 
           unless p1_info[ :p2_addr ]
             @mutex.synchronize do
-              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
+              p1_id = @socks[ p1 ]
+              @ctlw.write( [ CTL_CLOSE, p1_id ].pack( 'CQ>' ) )
             end
           end
         end
@@ -702,8 +712,9 @@ module P2p2
 
           if now - p1_info[ :last_traffic_at ] > EXPIRE_AFTER
             @mutex.synchronize do
-              # puts "debug ctlw close p1 #{ p1.object_id } #{ Time.new } p#{ Process.pid }"
-              @ctlw.write( [ CTL_CLOSE, p1.object_id ].pack( 'CQ>' ) )
+              p1_id = @socks[ p1 ]
+              # puts "debug ctlw close p1 #{ p1_id } #{ Time.new } p#{ Process.pid }"
+              @ctlw.write( [ CTL_CLOSE, p1_id ].pack( 'CQ>' ) )
             end
 
             break
@@ -759,8 +770,9 @@ module P2p2
 
           if p1_info[ :paused ] && ( p1_info[ :shadow_exts ].map{ | _, ext | ext[ :wmems ].size }.sum < RESUME_BELOW )
             @mutex.synchronize do
-              puts "ctlw resume #{ p1.object_id } #{ Time.new }"
-              @ctlw.write( [ CTL_RESUME, p1.object_id ].pack( 'CQ>' ) )
+              p1_id = @socks[ p1 ]
+              puts "ctlw resume #{ p1_id } #{ Time.new }"
+              @ctlw.write( [ CTL_RESUME, p1_id ].pack( 'CQ>' ) )
               p1_info[ :paused ] = false
             end
           end
@@ -877,7 +889,7 @@ module P2p2
       p1 = info[ :p1 ]
       return if p1.closed?
 
-      shadow_id = shadow.object_id
+      shadow_id = info[ :id ]
       p1_info = @infos[ p1 ]
       ext = p1_info[ :shadow_exts ][ shadow_id ]
       return unless ext
@@ -902,9 +914,12 @@ module P2p2
       @reads.delete( sock )
       @writes.delete( sock )
       @closings.delete( sock )
-      @socks.delete( sock.object_id )
       @roles.delete( sock )
-      @infos.delete( sock )
+      info = @infos.delete( sock )
+      sock_id = @socks.delete( sock )
+      @sock_ids.delete( sock_id )
+
+      info
     end
 
     def del_shadow_ext( p1_info, shadow_id )
