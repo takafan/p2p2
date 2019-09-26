@@ -295,8 +295,14 @@ module P2p2
               ranges << [ curr_pack_id, ext[ :biggest_app_pack_id ] ]
             end
 
+            pack_count = 0
             # puts "debug #{ ext[ :continue_app_pack_id ] }/#{ ext[ :biggest_app_pack_id ] } send MISS #{ ranges.size }"
             ranges.each do | pack_id_begin, pack_id_end |
+              if pack_count >= BREAK_SEND_MISS
+                puts "break send miss at #{ pack_id_begin } #{ Time.new }"
+                break
+              end
+
               ctlmsg = [
                 0,
                 MISS,
@@ -306,6 +312,7 @@ module P2p2
               ].pack( 'Q>CQ>Q>Q>' )
 
               send_pack( p1, ctlmsg, info[ :p2_addr ] )
+              pack_count += ( pack_id_end - pack_id_begin + 1 )
             end
           end
         when MISS
@@ -530,7 +537,7 @@ module P2p2
         end
       end
 
-      # 若写后到达上限，暂停取写前
+      # 若写后达到上限，暂停取写前
       if info[ :shadow_exts ].map{ | _, ext | ext[ :wmems ].size }.sum >= WMEMS_LIMIT
         unless info[ :paused ]
           puts "pause #{ Time.new }"
