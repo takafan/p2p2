@@ -91,7 +91,7 @@ module P2p2
       return if ( data.bytesize == 1 ) || ( data.bytesize > 255 ) || ( data =~ /\/|\.|\ / )
 
       sockaddr = addrinfo.to_sockaddr
-      title_path = File.join( @p2pd_dir, data )
+      title_path = File.join( @p2pd_dir, data.gsub( "\u0000" , '' ) )
 
       unless File.exist?( title_path )
         write_title( title_path, sockaddr )
