@@ -30,7 +30,7 @@ p1 --> nat --><-- nat <-- p2
 ssh --> p2 --> (encode) --> p1 --> (decode) --> sshd
 ```
 
-安装：
+## 使用篇
 
 ```bash
 gem install p2p2
@@ -39,25 +39,58 @@ gem install p2p2
 配对服务器：
 
 ```ruby
+# p2pd.rb
 require 'p2p2/p2pd'
 
-P2p2::P2pd.new( 5050 ).looping
+P2p2::P2pd.new '/etc/p2p2.conf.json'
+```
+
+```bash
+ruby p2pd.rb
 ```
 
 家：
 
 ```ruby
+# p1.rb
 require 'p2p2/p1'
 
-P2p2::P1.new( 'your.server.ip', 5050, '127.0.0.1', 22, '周立波' ).looping
+P2p2::P1.new '/boot/p2p2.conf.json'
+```
+
+```bash
+ruby p1.rb
 ```
 
 公司：
 
 ```ruby
+# p2.rb
 require 'p2p2/p2'
 
-P2p2::P2.new( 'your.server.ip', 5050, '0.0.0.0', 2222, '周立波' ).looping
+P2p2::P2.new '/boot/p2p2.conf.json'
+```
+
+```bash
+ruby p2.rb
+```
+
+p2p2.conf.json的格式：
+
+```javascript
+// p2p2.conf.json
+{
+    "p2pd_host": "1.2.3.4",           // 配对服务地址
+    "p2pd_port": 2020,                // 配对服务端口
+    "room": "libo",                   // 房间名
+    "appd_host": "127.0.0.1",         // 应用地址
+    "appd_port": 22,                  // 应用端口
+    "sdwd_host": "0.0.0.0",           // 代应用地址
+    "sdwd_port": 2222,                // 代应用端口
+    "p2pd_tmp_dir": "/tmp/p2p2.p2pd", // 配对服务缓存根路径
+    "p1_tmp_dir": "/tmp/p2p2.p1",     // p1缓存根路径
+    "p2_tmp_dir": "/tmp/p2p2.p2"      // p2缓存根路径
+}
 ```
 
 到家：

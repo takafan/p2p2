@@ -1,135 +1,120 @@
+require 'json'
 require 'p2p2/head'
+require 'p2p2/p2pd_worker'
 require 'p2p2/version'
 require 'socket'
 
 ##
 # P2p2::P2pd - 内网里的任意应用，访问另一个内网里的应用服务端。配对服务器端。
 #
-# 1.
-#
-# ```
-#                    p2pd
-#                    ^  ^
-#                  ^    ^
-#      “周立波的房间”     “周立波的房间”
-#      ^                         ^
-#     ^                         ^
-#   p1 --> nat --><-- nat <-- p2
-#
-# ```
-#
-# 2.
-#
-# ```
-#   ssh --> p2 --> (encode) --> p1 --> (decode) --> sshd
-# ```
-#
-# usage
-# =====
-#
-# 1. Girl::P2pd.new( 5050 ).looping # @server
-#
-# 2. Girl::P1.new( 'your.server.ip', 5050, '127.0.0.1', 22, '周立波' ).looping # @home1
-#
-# 3. Girl::P2.new( 'your.server.ip', 5050, '0.0.0.0', 2222, '周立波' ).looping # @home2
-#
-# 4. ssh -p2222 libo@localhost
-#
 # 包结构
 # ======
 #
-# Q>: 1+ app/shadow_id -> Q>: pack_id  -> traffic
-#     0  ctlmsg        -> C:  1 peer addr     -> p1/p2_sockaddr
-#                             2 heartbeat     -> C: random char
-#                             3 a new app     -> Q>: app_id
-#                             4 paired        -> Q>Q>: app_id shadow_id
-#                             5 shadow status -> Q>Q>Q>: shadow_id biggest_shadow_pack_id continue_app_pack_id
-#                             6 app status    -> Q>Q>Q>: app_id biggest_app_pack_id continue_shadow_pack_id
-#                             7 miss          -> Q>Q>Q>: app/shadow_id pack_id_begin pack_id_end
-#                             8 fin1          -> Q>: app/shadow_id
-#                             9 got fin1      -> Q>: app/shadow_id
-#                            10 fin2          -> Q>: app/shadow_id
-#                            11 got fin2      -> Q>: app/shadow_id
-#                            12 p1 fin
-#                            13 p2 fin
+# tund-p2pd, tun-p2pd:
+#
+# title
+#
+# p2pd-tund, p2pd-tun:
+#
+# Q>: 0  ctlmsg -> C:  1 peer addr -> tun sockaddr / tund sockaddr
+#
+# tun-tund:
+#
+# Q>: 0  ctlmsg -> C: 2 heartbeat     -> C: random char
+#                     3 a new source  -> Q>: src id
+#                     4 paired        -> Q>: src id -> n: dst port
+#                     5 dest status   -> n: dst port -> Q>: biggest relayed dst pack id -> Q>: continue src pack id
+#                     6 source status -> Q>: src id -> Q>: biggest relayed src pack id -> Q>: continue dst pack id
+#                     7 miss          -> Q>/n: src id / dst port -> Q>: pack id begin -> Q>: pack id end
+#                     8 fin1          -> Q>/n: src id / dst port -> Q>: biggest src pack id / biggest dst pack id -> Q>: continue dst pack id / continue src pack id
+#                     9 not use
+#                    10 fin2          -> Q>/n: src id / dst port
+#                    11 not use
+#                    12 tund fin
+#                    13 tun fin
+#
+# Q>: 1+ pack_id -> Q>/n: src id / dst port -> traffic
+#
+# close logic
+# ===========
+#
+# 1-1. after close src -> dst closed ? no -> send fin1
+# 1-2. tun recv fin2 -> del src ext
+#
+# 2-1. tun recv fin1 -> all traffic received ? -> close src after write
+# 2-2. tun recv traffic -> dst closed and all traffic received ? -> close src after write
+# 2-3. after close src -> dst closed ? yes -> del src ext -> send fin2
+#
+# 3-1. after close dst -> src closed ? no -> send fin1
+# 3-2. tund recv fin2 -> del dst ext
+#
+# 4-1. tund recv fin1 -> all traffic received ? -> close dst after write
+# 4-2. tund recv traffic -> src closed and all traffic received ? -> close dst after write
+# 4-3. after close dst -> src closed ? yes -> del dst ext -> send fin2
 #
 module P2p2
-  class P2pd
+  class P2pdWorker
 
-    ##
-    # p2pd_port 配对服务器端口
-    # p2pd_dir  可在该目录下看到所有的房间
-    def initialize( p2pd_port = 5050, p2pd_dir = '/tmp' )
-      p2pd = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
-      p2pd.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
-      p2pd.bind( Socket.pack_sockaddr_in( p2pd_port, '0.0.0.0' ) )
-
-      @p2pd = p2pd
-      @p2pd_dir = p2pd_dir
-    end
-
-    def looping
-      puts 'looping'
-
-      loop do
-        rs, _ = IO.select( [ @p2pd ] )
-        read_p2pd( rs.first )
-      end
-    rescue Interrupt => e
-      puts e.class
-      quit!
-    end
-
-    def quit!
-      exit
-    end
-
-    private
-
-    def read_p2pd( p2pd )
-      data, addrinfo, rflags, *controls = p2pd.recvmsg
-      return if ( data.bytesize == 1 ) || ( data.bytesize > 255 ) || ( data =~ /\/|\.|\ / )
-
-      sockaddr = addrinfo.to_sockaddr
-      title_path = File.join( @p2pd_dir, data.gsub( "\u0000" , '' ) )
-
-      unless File.exist?( title_path )
-        write_title( title_path, sockaddr )
-        return
+    def initialize( config_path = nil )
+      unless config_path
+        config_path = File.expand_path( '../p2p2.conf.json', __FILE__ )
       end
 
-      if Time.new - File.mtime( title_path ) > 300
-        write_title( title_path, sockaddr )
-        return
+      unless File.exist?( config_path )
+        raise "missing config file #{ config_path }"
       end
 
-      op_sockaddr = IO.binread( title_path )
+      conf = JSON.parse( IO.binread( config_path ), symbolize_names: true )
+      p2pd_port = conf[ :p2pd_port ]
+      p2pd_tmp_dir = conf[ :p2pd_tmp_dir ]
 
-      if Addrinfo.new( op_sockaddr ).ip_address == addrinfo.ip_address
-        write_title( title_path, sockaddr )
-        return
+      unless p2pd_port
+        p2pd_port = 5050
       end
 
-      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ op_sockaddr }", sockaddr )
-      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ sockaddr }", op_sockaddr )
-    end
+      unless p2pd_tmp_dir
+        p2pd_tmp_dir = '/tmp/p2p2.p2pd'
+      end
 
-    def write_title( title_path, sockaddr )
-      begin
-        # puts "debug write title #{ title_path } #{ Time.new }"
-        IO.binwrite( title_path, sockaddr )
-      rescue Errno::EISDIR, Errno::ENAMETOOLONG, Errno::ENOENT, ArgumentError => e
-        puts "binwrite #{ e.class } #{ Time.new }"
+      unless File.exist?( proxy_tmp_dir )
+        Dir.mkdir( proxy_tmp_dir )
+      end
+
+      title = "p2p2 p2pd #{ P2p2::VERSION }"
+      puts title
+      puts "p2pd port #{ p2pd_port }"
+      puts "p2pd tmp dir #{ p2pd_tmp_dir }"
+
+      if RUBY_PLATFORM.include?( 'linux' )
+        $0 = title
+
+        pid = fork do
+          $0 = 'p2p2 p2pd worker'
+          worker = P2p2::P2pdWorker.new( p2pd_port, p2pd_tmp_dir )
+
+          Signal.trap( :TERM ) do
+            puts "w#{ i } exit"
+            worker.quit!
+          end
+
+          worker.looping
+        end
+
+        Signal.trap( :TERM ) do
+          puts 'trap TERM'
+
+          begin
+            Process.kill( :TERM, pid )
+          rescue Errno::ESRCH => e
+            puts e.class
+          end
+        end
+
+        Process.waitall
+      else
+        P2p2::P2pdWorker.new( p2pd_port, p2pd_tmp_dir ).looping
       end
     end
 
-    def send_pack( sock, data, target_sockaddr )
-      begin
-        # puts "debug sendmsg #{ data.inspect } #{ Time.new }"
-        sock.sendmsg( data, 0, target_sockaddr )
-      rescue IO::WaitWritable, Errno::EINTR => e
-        puts "sendmsg #{ e.class } #{ Time.new }"
-      end
-    end
   end
 end
