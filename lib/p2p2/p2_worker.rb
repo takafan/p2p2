@@ -119,7 +119,7 @@ module P2p2
                 # puts "debug2 heartbeat"
                 add_tun_ctlmsg( pack_a_heartbeat )
                 next_tick
-              elsif now - @tun_info[ :last_recv_at ] > EXPIRE_NEW
+              elsif now - @tun_info[ :created_at ] > EXPIRE_NEW
                 # no tund addr
                 puts "#{ Time.new } expire new tun"
                 set_is_closing( @tun )
