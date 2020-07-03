@@ -275,6 +275,8 @@ module P2p2
     # is match tund addr
     #
     def is_match_tund_addr( addrinfo )
+      return false unless @tun_info[ :tund_addr ]
+
       from_addr = addrinfo.to_sockaddr
 
       if from_addr != @tun_info[ :tund_addr ]
@@ -283,6 +285,7 @@ module P2p2
       end
 
       @tun_info[ :last_recv_at ] = Time.new
+
       true
     end
 
