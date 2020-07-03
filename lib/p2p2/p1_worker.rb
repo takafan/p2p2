@@ -28,8 +28,7 @@ module P2p2
     #
     def looping
       puts "#{ Time.new } looping"
-      loop_update_room
-      loop_check_expire
+      loop_heartbeat
       loop_check_status
 
       loop do
@@ -80,75 +79,64 @@ module P2p2
     private
 
     ##
-    # loop update room
+    # loop heartbeat
     #
-    def loop_update_room( update_at = Time.new )
+    def loop_heartbeat( check_at = Time.new )
       Thread.new do
         loop do
-          sleep UPDATE_ROOM_INTERVAL
+          sleep HEARTBEAT_INTERVAL
 
           @mutex.synchronize do
-            if !@tund.closed? && @tund_info[ :peer_addr ].nil?
-              now = Time.new
-
-              if now - update_at >= 60
-                data = @room
-                update_at = now
-              else
-                data = [ rand( 128 ) ].pack( 'C' )
-              end
-
-              add_tund_ctlmsg( data, @p2pd_addr )
-              next_tick
-            end
-          end
-        end
-      end
-    end
-
-    ##
-    # loop check expire
-    #
-    def loop_check_expire
-      Thread.new do
-        loop do
-          sleep CHECK_EXPIRE_INTERVAL
-
-          @mutex.synchronize do
-            need_trigger = false
             now = Time.new
 
-            if !@tund.closed? && @tund_info[ :tun_addr ]
-              if now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER
-                puts "#{ Time.new } expire tund"
-                set_is_closing( @tund )
-              else
-                # puts "debug1 #{ Time.new } heartbeat"
-                add_tund_ctlmsg( pack_a_heartbeat )
+            unless @tund.closed?
+              if @tund_info[ :peer_addr ]
+                if @tund_info[ :tun_addr ]
+                  if now - check_at >= CHECK_EXPIRE_INTERVAL
+                    if now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER
+                      puts "#{ Time.new } expire tund"
+                      set_is_closing( @tund )
+                    else
+                      @tund_info[ :dst_exts ].each do | dst_local_port, dst_ext |
+                        if dst_ext[ :dst ].closed? && ( now - dst_ext[ :last_continue_at ] > EXPIRE_AFTER )
+                          puts "#{ Time.new } expire dst ext #{ dst_local_port }"
+                          del_dst_ext( dst_local_port )
+                        end
+                      end
+                    end
 
-                @tund_info[ :dst_exts ].each do | dst_local_port, dst_ext |
-                  if dst_ext[ :dst ].closed? && ( now - dst_ext[ :last_continue_at ] > EXPIRE_AFTER )
-                    puts "#{ Time.new } expire dst ext #{ dst_local_port }"
-                    del_dst_ext( dst_local_port )
+                    @dst_infos.each do | dst, dst_info |
+                      if dst_info[ :last_recv_at ].nil? && ( now - dst_info[ :created_at ] > EXPIRE_NEW )
+                        puts "#{ Time.new } expire dst"
+                        set_is_closing( dst )
+                      end
+                    end
+
+                    check_at = now
                   end
+
+                  # puts "debug2 heartbeat"
+                  add_tund_ctlmsg( pack_a_heartbeat )
+                  next_tick
+                elsif now - @tund_info[ :last_recv_at ] > EXPIRE_NEW
+                  # no tun addr
+                  puts "#{ Time.new } expire new tund"
+                  set_is_closing( @tund )
+                  next_tick
                 end
+              else
+                # no peer addr
+                if now - check_at >= UPDATE_ROOM_INTERVAL
+                  data = @room
+                  check_at = now
+                else
+                  data = [ rand( 128 ) ].pack( 'C' )
+                end
+
+                # puts "debug2 update room"
+                add_tund_ctlmsg( data, @p2pd_addr )
+                next_tick
               end
-
-              need_trigger = true
-            end
-
-            @dst_infos.each do | dst, dst_info |
-              is_expired = dst_info[ :last_recv_at ].nil? && ( now - dst_info[ :created_at ] > EXPIRE_NEW )
-
-              if is_expired
-                puts "#{ Time.new } expire dst"
-                set_is_closing( dst )
-                need_trigger = true
-              end
-            end
-
-            if need_trigger
-              next_tick
             end
           end
         end

@@ -28,7 +28,7 @@ module P2p2
     #
     def looping
       puts "#{ Time.new } looping"
-      loop_check_expire
+      loop_heartbeat
       loop_check_status
 
       loop do
@@ -81,48 +81,50 @@ module P2p2
     private
 
     ##
-    # loop check expire
+    # loop heartbeat
     #
-    def loop_check_expire
+    def loop_heartbeat( check_at = Time.new )
       Thread.new do
         loop do
-          sleep CHECK_EXPIRE_INTERVAL
+          sleep HEARTBEAT_INTERVAL
 
           @mutex.synchronize do
-            need_trigger = false
             now = Time.new
 
-            if @tun && !@tun.closed? && @tun_info[ :tund_addr ]
-              if now - @tun_info[ :last_recv_at ] > EXPIRE_AFTER
-                puts "#{ Time.new } expire tun"
-                set_is_closing( @tun )
-              else
-                # puts "debug1 #{ Time.new } heartbeat"
-                add_tun_ctlmsg( pack_a_heartbeat )
-
-                @tun_info[ :src_exts ].each do | src_id, src_ext |
-                  if src_ext[ :src ].closed? && ( now - src_ext[ :last_continue_at ] > EXPIRE_AFTER )
-                    puts "#{ Time.new } expire src ext #{ src_id }"
-                    del_src_ext( src_id )
+            if @tun && !@tun.closed? && @tun_info[ :peer_addr ]
+              if @tun_info[ :tund_addr ]
+                if now - check_at >= CHECK_EXPIRE_INTERVAL
+                  if now - @tun_info[ :last_recv_at ] > EXPIRE_AFTER
+                    puts "#{ Time.new } expire tun"
+                    set_is_closing( @tun )
+                  else
+                    @tun_info[ :src_exts ].each do | src_id, src_ext |
+                      if src_ext[ :src ].closed? && ( now - src_ext[ :last_continue_at ] > EXPIRE_AFTER )
+                        puts "#{ Time.new } expire src ext #{ src_id }"
+                        del_src_ext( src_id )
+                      end
+                    end
                   end
+
+                  @src_infos.each do | src, src_info |
+                    if src_info[ :last_recv_at ].nil? && ( now - src_info[ :created_at ] > EXPIRE_NEW )
+                      puts "#{ Time.new } expire src"
+                      set_is_closing( src )
+                    end
+                  end
+
+                  check_at = now
                 end
+
+                # puts "debug2 heartbeat"
+                add_tun_ctlmsg( pack_a_heartbeat )
+                next_tick
+              elsif now - @tun_info[ :last_recv_at ] > EXPIRE_NEW
+                # no tund addr
+                puts "#{ Time.new } expire new tun"
+                set_is_closing( @tun )
+                next_tick
               end
-
-              need_trigger = true
-            end
-
-            @src_infos.each do | src, src_info |
-              is_expired = src_info[ :last_recv_at ].nil? && ( now - src_info[ :created_at ] > EXPIRE_NEW )
-
-              if is_expired
-                puts "#{ Time.new } expire src"
-                set_is_closing( src )
-                need_trigger = true
-              end
-            end
-
-            if need_trigger
-              next_tick
             end
           end
         end
