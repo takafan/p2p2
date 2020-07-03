@@ -12,7 +12,7 @@ require 'socket'
 #
 # tund-p2pd, tun-p2pd:
 #
-# title
+# room
 #
 # p2pd-tund, p2pd-tun:
 #
@@ -53,7 +53,7 @@ require 'socket'
 # 4-3. after close dst -> src closed ? yes -> del dst ext -> send fin2
 #
 module P2p2
-  class P2pdWorker
+  class P2pd
 
     def initialize( config_path = nil )
       unless config_path
@@ -69,15 +69,15 @@ module P2p2
       p2pd_tmp_dir = conf[ :p2pd_tmp_dir ]
 
       unless p2pd_port
-        p2pd_port = 5050
+        p2pd_port = 2020
       end
 
       unless p2pd_tmp_dir
         p2pd_tmp_dir = '/tmp/p2p2.p2pd'
       end
 
-      unless File.exist?( proxy_tmp_dir )
-        Dir.mkdir( proxy_tmp_dir )
+      unless File.exist?( p2pd_tmp_dir )
+        Dir.mkdir( p2pd_tmp_dir )
       end
 
       title = "p2p2 p2pd #{ P2p2::VERSION }"
@@ -93,7 +93,7 @@ module P2p2
           worker = P2p2::P2pdWorker.new( p2pd_port, p2pd_tmp_dir )
 
           Signal.trap( :TERM ) do
-            puts "w#{ i } exit"
+            puts 'exit'
             worker.quit!
           end
 

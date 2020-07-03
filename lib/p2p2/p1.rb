@@ -1,6 +1,6 @@
 require 'json'
-require 'p2p2/custom'
 require 'p2p2/head'
+require 'p2p2/p1_custom'
 require 'p2p2/p1_worker'
 require 'p2p2/version'
 require 'socket'
@@ -9,7 +9,7 @@ require 'socket'
 # P2p2::P1 - 内网里的任意应用，访问另一个内网里的应用服务端。p1端。
 #
 module P2p2
-  class P1Worker
+  class P1
 
     def initialize( config_path = nil )
       unless config_path
@@ -37,7 +37,7 @@ module P2p2
       end
 
       unless p2pd_port
-        p2pd_port = 5050
+        p2pd_port = 2020
       end
 
       unless appd_host
@@ -87,7 +87,7 @@ module P2p2
           worker = P2p2::P1Worker.new( p2pd_host, p2pd_port, room, appd_host, appd_port, dst_chunk_dir, tund_chunk_dir )
 
           Signal.trap( :TERM ) do
-            puts "w#{ i } exit"
+            puts 'exit'
             worker.quit!
           end
 

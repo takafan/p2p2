@@ -32,45 +32,46 @@ module P2p2
       data, addrinfo, rflags, *controls = p2pd.recvmsg
       return if ( data.bytesize == 1 ) || ( data.bytesize > 255 ) || ( data =~ /\/|\.|\ / )
 
-      sockaddr = addrinfo.to_sockaddr
+      from_addr = addrinfo.to_sockaddr
       room_path = File.join( @p2pd_tmp_dir, data.gsub( "\u0000" , '' ) )
 
       unless File.exist?( room_path )
-        write_room( room_path, sockaddr )
+        puts "#{ Time.new } create #{ room_path } #{ addrinfo.inspect }"
+        write_room( room_path, from_addr )
         return
       end
 
       if Time.new - File.mtime( room_path ) > EXPIRE_AFTER
-        write_room( room_path, sockaddr )
+        puts "#{ Time.new } overwrite #{ room_path } #{ addrinfo.inspect }"
+        write_room( room_path, from_addr )
         return
       end
 
-      op_sockaddr = IO.binread( room_path )
+      op_addr = IO.binread( room_path )
+      op_addrinfo = Addrinfo.new( op_addr )
 
-      if Addrinfo.new( op_sockaddr ).ip_address == addrinfo.ip_address
-        write_room( room_path, sockaddr )
-        return
+      if ( addrinfo.ip_address == op_addrinfo.ip_address ) || ( addrinfo.ip_port == op_addrinfo.ip_port )
+        write_room( room_path, from_addr )
+      else
+        puts "#{ Time.new } paired #{ addrinfo.inspect } #{ op_addrinfo.inspect }"
+        send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), op_addr ].join, from_addr )
+        send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), from_addr ].join, op_addr )
       end
-
-      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ op_sockaddr }", sockaddr )
-      send_pack( p2pd, "#{ [ 0, PEER_ADDR ].pack( 'Q>C' ) }#{ sockaddr }", op_sockaddr )
     end
 
-    def write_room( room_path, sockaddr )
+    def write_room( room_path, data )
       begin
-        # puts "debug write room #{ room_path } #{ Time.new }"
-        IO.binwrite( room_path, sockaddr )
+        IO.binwrite( room_path, data )
       rescue Errno::EISDIR, Errno::ENAMETOOLONG, Errno::ENOENT, ArgumentError => e
         puts "binwrite #{ e.class } #{ Time.new }"
       end
     end
 
-    def send_pack( sock, data, target_sockaddr )
+    def send_pack( data, target_addr )
       begin
-        # puts "debug sendmsg #{ data.inspect } #{ Time.new }"
-        sock.sendmsg( data, 0, target_sockaddr )
+        @p2pd.sendmsg( data, 0, target_addr )
       rescue IO::WaitWritable, Errno::EINTR => e
-        puts "sendmsg #{ e.class } #{ Time.new }"
+        puts "#{ Time.new } sendmsg ignore #{ e.class }"
       end
     end
   end

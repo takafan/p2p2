@@ -1,5 +1,5 @@
 module P2p2
-  PACK_SIZE             = 1328             # 包大小 1400(console MTU) - 8(PPPoE header) - 40(IPv6 header) - 8(UDP header) - 8(app id / shadow id) - 8(pack id) = 1328
+  PACK_SIZE             = 1328             # 包大小 1400(console MTU) - 8(PPPoE header) - 40(IPv6 header) - 8(UDP header) - 8(pack id) - 8(src id) = 1328
   CHUNK_SIZE            = PACK_SIZE * 1000 # 块大小
   WBUFFS_LIMIT          = 1000             # 写前上限，超过上限结一个块
   WMEMS_LIMIT           = 100_000          # 写后上限，达到上限暂停写
@@ -11,6 +11,7 @@ module P2p2
   SEND_STATUS_UNTIL     = 10               # 持续的告之对面状态，直到没有流量往来，持续多少秒
   BREAK_SEND_MISS       = 10_000           # miss包个数上限，达到上限忽略要后面的段，可控碎片缓存
   CONFUSE_UNTIL         = 5                # 混淆前几个包
+  UPDATE_ROOM_INTERVAL  = 60               # 刷新房间间隔
   PEER_ADDR             = 1
   HEARTBEAT             = 2
   A_NEW_SOURCE          = 3

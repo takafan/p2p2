@@ -19,8 +19,10 @@ p2p2.gemspec
 lib/p2p2.rb
 lib/p2p2/custom.rb
 lib/p2p2/head.rb
+lib/p2p2/p1_custom.rb
 lib/p2p2/p1_worker.rb
 lib/p2p2/p1.rb
+lib/p2p2/p2_custom.rb
 lib/p2p2/p2_worker.rb
 lib/p2p2/p2.rb
 lib/p2p2/p2pd_worker.rb

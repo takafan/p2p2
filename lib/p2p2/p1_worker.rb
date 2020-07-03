@@ -1,18 +1,20 @@
 module P2p2
   class P1Worker
 
+    ##
+    # initialize
+    #
     def initialize( p2pd_host, p2pd_port, room, appd_host, appd_port, dst_chunk_dir, tund_chunk_dir )
-      @p2pd_sockaddr = Socket.sockaddr_in( p2pd_port, p2pd_host )
+      @p2pd_addr = Socket.sockaddr_in( p2pd_port, p2pd_host )
       @room = room
-      @appd_sockaddr = Socket.sockaddr_in( appd_port, appd_host )
+      @appd_addr = Socket.sockaddr_in( appd_port, appd_host )
       @dst_chunk_dir = dst_chunk_dir
       @tund_chunk_dir = tund_chunk_dir
-      @custom = P2p2::Custom.new
+      @custom = P2p2::P1Custom.new
       @mutex = Mutex.new
       @reads = []
       @writes = []
-      @roles = {}     # sock => :dotr / :p1 / :dst / :tund
-      @dsts = {}      # local_port => dst
+      @roles = {}     # sock => :dotr / :dst / :tund
       @dst_infos = {} # dst => {}
 
       dotr, dotw = IO.pipe
@@ -21,8 +23,12 @@ module P2p2
       new_a_tund
     end
 
+    ##
+    # looping
+    #
     def looping
       puts "#{ Time.new } looping"
+      loop_update_room
       loop_check_expire
       loop_check_status
 
@@ -57,8 +63,11 @@ module P2p2
       quit!
     end
 
+    ##
+    # quit!
+    #
     def quit!
-      if @tund && !@tund.closed? && @tund_info[ :tun_addr ]
+      if !@tund.closed? && @tund_info[ :tun_addr ]
         # puts "debug1 send tund fin"
         data = [ 0, TUND_FIN ].pack( 'Q>C' )
         @tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
@@ -69,6 +78,24 @@ module P2p2
     end
 
     private
+
+    ##
+    # loop update room
+    #
+    def loop_update_room
+      Thread.new do
+        loop do
+          sleep UPDATE_ROOM_INTERVAL
+
+          @mutex.synchronize do
+            if !@tund.closed? && @tund_info[ :peer_addr ].nil?
+              add_tund_ctlmsg( @room, @p2pd_addr )
+              next_tick
+            end
+          end
+        end
+      end
+    end
 
     ##
     # loop check expire
@@ -82,10 +109,8 @@ module P2p2
             need_trigger = false
             now = Time.new
 
-            unless @tund.closed?
-              is_expired = @tund_info[ :last_recv_at ] ? ( now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER ) : ( now - @tund_info[ :created_at ] > EXPIRE_NEW )
-
-              if is_expired
+            if !@tund.closed? && @tund_info[ :tun_addr ]
+              if now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER
                 puts "#{ Time.new } expire tund"
                 set_is_closing( @tund )
               else
@@ -167,7 +192,7 @@ module P2p2
     def loop_punch_peer
       Thread.new do
         EXPIRE_NEW.times do
-          if @tund.closed? || @tund_info[ :tun_addr ]
+          if @tund.closed?
             # puts "debug1 break loop punch peer"
             break
           end
@@ -188,15 +213,15 @@ module P2p2
     #
     def new_a_tund
       tund = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
-      tund.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEPORT, 1 )
       tund.bind( Socket.sockaddr_in( 0, '0.0.0.0' ) )
       port = tund.local_address.ip_port
+      puts "#{ Time.new } tund bind on #{ port }"
+
       tund_info = {
         port: port,           # 端口
-        ctlmsg_rbuffs: [],    # 还没配上tun，暂存的ctlmsg [ to_addr, data ]
         ctlmsgs: [],          # [ to_addr, data ]
-        wbuffs: [],           # 写前缓存 [ dst_id, pack_id, data ]
-        caches: [],           # 块读出缓存 [ dst_id, pack_id, data ]
+        wbuffs: [],           # 写前缓存 [ dst_local_port, pack_id, data ]
+        caches: [],           # 块读出缓存 [ dst_local_port, pack_id, data ]
         chunks: [],           # 块队列 filename
         spring: 0,            # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
         peer_addr: nil,       # 对面地址
@@ -213,7 +238,7 @@ module P2p2
       @tund = tund
       @tund_info = tund_info
       add_read( tund, :tund )
-      add_tund_ctlmsg( @room, @p2pd_sockaddr )
+      add_tund_ctlmsg( @room, @p2pd_addr )
     end
 
     ##
@@ -230,16 +255,11 @@ module P2p2
       from_addr = addrinfo.to_sockaddr
 
       if from_addr != @tund_info[ :tun_addr ]
-        if addrinfo.ip_port == Addrinfo.new( @tund_info[ :tun_addr ] ).ip_port
-          puts "#{ Time.new } tun ip changed #{ addrinfo.inspect }"
-          @tund_info[ :tun_addr ] = from_addr
-        else
-          puts "#{ Time.new } #{ addrinfo.inspect } not match #{ Addrinfo.new( @tund_info[ :tun_addr ] ).inspect }"
-          return false
-        end
+        puts "#{ Time.new } #{ addrinfo.inspect } not match #{ Addrinfo.new( @tund_info[ :tun_addr ] ).inspect }"
+        return false
       end
 
-      @tund_info[ :last_recv_at ] = now
+      @tund_info[ :last_recv_at ] = Time.new
       true
     end
 
@@ -254,16 +274,14 @@ module P2p2
       if to_addr
         @tund_info[ :ctlmsgs ] << [ to_addr, data ]
         add_write( @tund )
-      else
-        @tund_info[ :ctlmsg_rbuffs ] << data
       end
     end
 
     ##
     # add tund wbuff
     #
-    def add_tund_wbuff( dst_id, pack_id, data )
-      @tund_info[ :wbuffs ] << [ dst_id, pack_id, data ]
+    def add_tund_wbuff( dst_local_port, pack_id, data )
+      @tund_info[ :wbuffs ] << [ dst_local_port, pack_id, data ]
 
       if @tund_info[ :wbuffs ].size >= WBUFFS_LIMIT
         spring = @tund_info[ :chunks ].size > 0 ? ( @tund_info[ :spring ] + 1 ) : 0
@@ -302,7 +320,7 @@ module P2p2
         begin
           IO.binwrite( chunk_path, dst_info[ :wbuff ] )
         rescue Errno::ENOSPC => e
-          puts "p#{ Process.pid } #{ Time.new } #{ e.class }, close dst"
+          puts "#{ Time.new } #{ e.class }, close dst"
           set_is_closing( dst )
           return
         end
@@ -390,7 +408,7 @@ module P2p2
     end
 
     ##
-    # close tun
+    # close tund
     #
     def close_tund( tund )
       # puts "debug1 close tund"
@@ -509,6 +527,7 @@ module P2p2
     def write_tund( tund )
       if @tund_info[ :is_closing ]
         close_tund( tund )
+        new_a_tund
         return
       end
 
@@ -549,7 +568,7 @@ module P2p2
       # 若写后达到上限，暂停取写前
       if @tund_info[ :dst_exts ].map{ | _, dst_ext | dst_ext[ :wmems ].size }.sum >= WMEMS_LIMIT
         unless @tund_info[ :paused ]
-          puts "p#{ Process.pid } #{ Time.new } pause tund #{ @tund_info[ :port ] }"
+          puts "#{ Time.new } pause tund #{ @tund_info[ :port ] }"
           @tund_info[ :paused ] = true
         end
 
@@ -668,12 +687,20 @@ module P2p2
 
         case ctl_num
         when PEER_ADDR
-          return if @tund_info[ :peer_addr ] || ( addrinfo.to_sockaddr != @p2pd_sockaddr )
+          return if @tund_info[ :peer_addr ] || ( addrinfo.to_sockaddr != @p2pd_addr )
 
           peer_addr = data[ 9..-1 ]
-          @tund_info[ :peer_addr ] = data[ 9..-1 ]
-          # puts "debug1 got peer addr #{ Addrinfo.new( peer_addr ).ip_unpack.inspect }"
+          puts "#{ Time.new } got peer addr #{ Addrinfo.new( peer_addr ).inspect }"
+
+          @tund_info[ :peer_addr ] = peer_addr
           loop_punch_peer
+        when HEARTBEAT
+          from_addr = addrinfo.to_sockaddr
+          return if from_addr != @tund_info[ :peer_addr ]
+
+          # puts "debug1 set tun addr #{ Addrinfo.new( from_addr ).inspect }"
+          @tund_info[ :tun_addr ] = from_addr
+          @tund_info[ :last_recv_at ] = now
         when A_NEW_SOURCE
           return unless is_match_tun_addr( addrinfo )
 
@@ -690,13 +717,16 @@ module P2p2
             end
           else
             dst = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
-            dst.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
+
+            if RUBY_PLATFORM.include?( 'linux' )
+              dst.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
+            end
 
             begin
-              dst.connect_nonblock( @appd_sockaddr )
+              dst.connect_nonblock( @appd_addr )
             rescue IO::WaitWritable
             rescue Exception => e
-              puts "p#{ Process.pid } #{ Time.new } connect appd #{ e.class }"
+              puts "#{ Time.new } connect appd #{ e.class }"
               return
             end
 
@@ -742,7 +772,7 @@ module P2p2
           dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
           return unless dst_local_port
 
-          dst_ext = tund_info[ :dst_exts ][ dst_local_port ]
+          dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
           return unless dst_ext
 
           # puts "debug2 got source status"
