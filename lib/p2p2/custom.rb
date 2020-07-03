@@ -1,4 +1,4 @@
-module P2pd
+module P2p2
   module Custom
     def encode( data )
       # overwrite me, you'll be free
