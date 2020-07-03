@@ -82,14 +82,23 @@ module P2p2
     ##
     # loop update room
     #
-    def loop_update_room
+    def loop_update_room( update_at = Time.new )
       Thread.new do
         loop do
           sleep UPDATE_ROOM_INTERVAL
 
           @mutex.synchronize do
             if !@tund.closed? && @tund_info[ :peer_addr ].nil?
-              add_tund_ctlmsg( @room, @p2pd_addr )
+              now = Time.new
+
+              if now - update_at >= 60
+                data = @room
+                update_at = now
+              else
+                data = [ rand( 128 ) ].pack( 'C' )
+              end
+
+              add_tund_ctlmsg( data, @p2pd_addr )
               next_tick
             end
           end
