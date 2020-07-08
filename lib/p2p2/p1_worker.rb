@@ -539,6 +539,10 @@ module P2p2
           tund.sendmsg( data, 0, to_addr )
         rescue IO::WaitWritable, Errno::EINTR
           return
+        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
+          puts "#{ Time.new } #{ e.class }, close tund"
+          close_tund( tund )
+          return
         end
 
         @tund_info[ :ctlmsgs ].shift
@@ -556,6 +560,10 @@ module P2p2
             begin
               tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
             rescue IO::WaitWritable, Errno::EINTR
+              return
+            rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
+              puts "#{ Time.new } #{ e.class }, close tund"
+              close_tund( tund )
               return
             end
           end
@@ -624,6 +632,10 @@ module P2p2
         begin
           tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
         rescue IO::WaitWritable, Errno::EINTR
+          return
+        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
+          puts "#{ Time.new } #{ e.class }, close tund"
+          close_tund( tund )
           return
         end
 
