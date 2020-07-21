@@ -99,14 +99,14 @@ module P2p2
                     else
                       @tund_info[ :dst_exts ].each do | dst_local_port, dst_ext |
                         if dst_ext[ :dst ].closed? && ( now - dst_ext[ :last_continue_at ] > EXPIRE_AFTER )
-                          puts "#{ Time.new } expire dst ext #{ dst_local_port }"
+                          puts "#{ Time.new } expire dst ext"
                           del_dst_ext( dst_local_port )
                         end
                       end
                     end
 
                     @dst_infos.each do | dst, dst_info |
-                      if dst_info[ :last_recv_at ].nil? && ( now - dst_info[ :created_at ] > EXPIRE_NEW )
+                      if now - dst_info[ :last_continue_at ] > EXPIRE_AFTER
                         puts "#{ Time.new } expire dst"
                         set_is_closing( dst )
                       end
@@ -519,6 +519,7 @@ module P2p2
       # puts "debug2 write dst #{ written }"
       data = data[ written..-1 ]
       dst_info[ from ] = data
+      dst_info[ :last_continue_at ] = Time.new
     end
 
     ##
@@ -673,7 +674,7 @@ module P2p2
 
       # puts "debug2 read dst #{ data.inspect }"
       dst_info = @dst_infos[ dst ]
-      dst_info[ :last_recv_at ] = Time.new
+      dst_info[ :last_continue_at ] = Time.new
 
       if @tund.closed?
         puts "#{ Time.new } tund closed, close dst"
@@ -751,8 +752,7 @@ module P2p2
               cache: '',                  # 块读出缓存
               chunks: [],                 # 块队列，写前达到块大小时结一个块 filename
               spring: 0,                  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-              created_at: Time.new,       # 创建时间
-              last_recv_at: nil,          # 上一次收到流量的时间，过期关闭
+              last_continue_at: Time.new, # 上一次发生流量的时间
               is_closing: false           # 是否准备关闭
             }
             add_read( dst, :dst )
@@ -769,7 +769,7 @@ module P2p2
               is_src_closed: false,      # src是否已关闭
               biggest_src_pack_id: 0,    # src最大包号码
               completed_pack_id: 0,      # 完成到几（对面收到几）
-              last_continue_at: Time.new # 创建，或者上一次收到连续流量，或者发出新包的时间
+              last_continue_at: Time.new # 上一次发生流量的时间
             }
           end
 

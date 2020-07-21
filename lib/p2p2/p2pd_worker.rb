@@ -32,17 +32,21 @@ module P2p2
       data, addrinfo, rflags, *controls = p2pd.recvmsg
       return if ( data.bytesize == 1 ) || ( data.bytesize > 255 ) || ( data =~ /\/|\.|\ / )
 
+      if data[0] == '2'
+        is_p2 = true
+        data = data[ 1..-1 ]
+      else
+        is_p2 = false
+      end
+
       from_addr = addrinfo.to_sockaddr
       room_path = File.join( @p2pd_tmp_dir, data.gsub( "\u0000" , '' ) )
 
-      unless File.exist?( room_path )
-        puts "#{ Time.new } create #{ room_path } #{ addrinfo.inspect }"
-        write_room( room_path, from_addr )
-        return
-      end
-
-      if Time.new - File.mtime( room_path ) > EXPIRE_AFTER
-        puts "#{ Time.new } overwrite #{ room_path } #{ addrinfo.inspect }"
+      if is_p2
+        unless File.exist?( room_path )
+          return
+        end
+      else
         write_room( room_path, from_addr )
         return
       end
@@ -50,13 +54,9 @@ module P2p2
       op_addr = IO.binread( room_path )
       op_addrinfo = Addrinfo.new( op_addr )
 
-      if ( addrinfo.ip_address == op_addrinfo.ip_address ) || ( addrinfo.ip_port == op_addrinfo.ip_port )
-        write_room( room_path, from_addr )
-      else
-        puts "#{ Time.new } paired #{ addrinfo.inspect } #{ op_addrinfo.inspect }"
-        send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), op_addr ].join, from_addr )
-        send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), from_addr ].join, op_addr )
-      end
+      puts "#{ Time.new } paired #{ addrinfo.inspect } #{ op_addrinfo.inspect }"
+      send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), op_addr ].join, from_addr )
+      send_pack( [ [ 0, PEER_ADDR ].pack( 'Q>C' ), from_addr ].join, op_addr )
     end
 
     def write_room( room_path, data )

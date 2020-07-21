@@ -100,14 +100,14 @@ module P2p2
                   else
                     @tun_info[ :src_exts ].each do | src_id, src_ext |
                       if src_ext[ :src ].closed? && ( now - src_ext[ :last_continue_at ] > EXPIRE_AFTER )
-                        puts "#{ Time.new } expire src ext #{ src_id }"
+                        puts "#{ Time.new } expire src ext"
                         del_src_ext( src_id )
                       end
                     end
                   end
 
                   @src_infos.each do | src, src_info |
-                    if src_info[ :last_recv_at ].nil? && ( now - src_info[ :created_at ] > EXPIRE_NEW )
+                    if now - src_info[ :last_continue_at ] > EXPIRE_AFTER
                       puts "#{ Time.new } expire src"
                       set_is_closing( src )
                     end
@@ -263,7 +263,7 @@ module P2p2
       @tun = tun
       @tun_info = tun_info
       add_read( tun, :tun )
-      add_tun_ctlmsg( @room, @p2pd_addr )
+      add_tun_ctlmsg( [ '2', @room ].join, @p2pd_addr )
     end
 
     ##
@@ -546,6 +546,7 @@ module P2p2
       # puts "debug2 write src #{ written }"
       data = data[ written..-1 ]
       src_info[ from ] = data
+      src_info[ :last_continue_at ] = Time.new
     end
 
     ##
@@ -697,16 +698,15 @@ module P2p2
       # puts "debug1 accept a src #{ addrinfo.inspect } #{ id }"
 
       @src_infos[ src ] = {
-        id: id,                  # id
-        biggest_pack_id: 0,      # 最大包号码
-        rbuffs: [],              # p1端dst未准备好，暂存流量 [ pack_id, data ]
-        wbuff: '',               # 写前
-        cache: '',               # 块读出缓存
-        chunks: [],              # 块队列，写前达到块大小时结一个块 filename
-        spring: 0,               # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-        created_at: Time.new,    # 创建时间
-        last_recv_at: nil,       # 上一次收到流量的时间，过期关闭
-        is_closing: false        # 是否准备关闭
+        id: id,                     # id
+        biggest_pack_id: 0,         # 最大包号码
+        rbuffs: [],                 # p1端dst未准备好，暂存流量 [ pack_id, data ]
+        wbuff: '',                  # 写前
+        cache: '',                  # 块读出缓存
+        chunks: [],                 # 块队列，写前达到块大小时结一个块 filename
+        spring: 0,                  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
+        last_continue_at: Time.new, # 上一次发生流量的时间
+        is_closing: false           # 是否准备关闭
       }
 
       add_read( src, :src )
@@ -726,7 +726,7 @@ module P2p2
         is_dst_closed: false,      # dst是否已关闭
         biggest_dst_pack_id: 0,    # dst最大包号码
         completed_pack_id: 0,      # 完成到几（对面收到几）
-        last_continue_at: Time.new # 创建，或者上一次收到连续流量，或者发出新包的时间
+        last_continue_at: Time.new # 上一次发生流量的时间
       }
 
       @tun_info[ :src_exts ][ id ] = src_ext
@@ -750,7 +750,7 @@ module P2p2
 
       # puts "debug2 read src #{ data.inspect }"
       src_info = @src_infos[ src ]
-      src_info[ :last_recv_at ] = Time.new
+      src_info[ :last_continue_at ] = Time.new
       src_id = src_info[ :id ]
       src_ext = @tun_info[ :src_exts ][ src_id ]
 
