@@ -543,6 +543,8 @@ module P2p2
         rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
           puts "#{ Time.new } #{ e.class }, close tund"
           close_tund( tund )
+          sleep HEARTBEAT_INTERVAL
+          new_a_tund
           return
         end
 
@@ -565,6 +567,8 @@ module P2p2
             rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
               puts "#{ Time.new } #{ e.class }, close tund"
               close_tund( tund )
+              sleep HEARTBEAT_INTERVAL
+              new_a_tund
               return
             end
           end
@@ -637,6 +641,8 @@ module P2p2
         rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
           puts "#{ Time.new } #{ e.class }, close tund"
           close_tund( tund )
+          sleep HEARTBEAT_INTERVAL
+          new_a_tund
           return
         end
 
