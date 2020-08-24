@@ -375,6 +375,25 @@ module P2p2
     end
 
     ##
+    # send data
+    #
+    def send_data( tund, data, to_addr )
+      begin
+        tund.sendmsg( data, 0, to_addr )
+      rescue IO::WaitWritable, Errno::EINTR
+        return false
+      rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH, Errno::ENETDOWN => e
+        puts "#{ Time.new } #{ e.class }, close tund"
+        close_tund( tund )
+        sleep HEARTBEAT_INTERVAL
+        new_a_tund
+        return false
+      end
+
+      true
+    end
+
+    ##
     # close dst
     #
     def close_dst( dst )
@@ -475,15 +494,14 @@ module P2p2
     #
     def write_dst( dst )
       dst_info = @dst_infos[ dst ]
-      data = dst_info[ :cache ]
-      from = :cache
+      from, data = :cache, dst_info[ :cache ]
 
       if data.empty?
         if dst_info[ :chunks ].any?
           path = File.join( @dst_chunk_dir, dst_info[ :chunks ].shift )
 
           begin
-            dst_info[ :cache ] = data = IO.binread( path )
+            data = dst_info[ :cache ] = IO.binread( path )
             File.delete( path )
           rescue Errno::ENOENT => e
             puts "#{ Time.new } read #{ path } #{ e.class }"
@@ -491,8 +509,7 @@ module P2p2
             return
           end
         else
-          data = dst_info[ :wbuff ]
-          from = :wbuff
+          from, data = :wbuff, dst_info[ :wbuff ]
         end
       end
 
@@ -532,19 +549,13 @@ module P2p2
         return
       end
 
+      now = Time.new
+
       # 传ctlmsg
       while @tund_info[ :ctlmsgs ].any?
         to_addr, data = @tund_info[ :ctlmsgs ].first
 
-        begin
-          tund.sendmsg( data, 0, to_addr )
-        rescue IO::WaitWritable, Errno::EINTR
-          return
-        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-          puts "#{ Time.new } #{ e.class }, close tund"
-          close_tund( tund )
-          sleep HEARTBEAT_INTERVAL
-          new_a_tund
+        unless send_data( tund, data, to_addr )
           return
         end
 
@@ -560,22 +571,15 @@ module P2p2
           data = dst_ext[ :wmems ][ pack_id ]
 
           if data
-            begin
-              tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
-            rescue IO::WaitWritable, Errno::EINTR
-              return
-            rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-              puts "#{ Time.new } #{ e.class }, close tund"
-              close_tund( tund )
-              sleep HEARTBEAT_INTERVAL
-              new_a_tund
+            unless send_data( tund, data, @tund_info[ :tun_addr ] )
               return
             end
+
+            dst_ext[ :last_continue_at ] = now
           end
         end
 
         @tund_info[ :resendings ].shift
-        return
       end
 
       # 若写后达到上限，暂停取写前
@@ -591,8 +595,7 @@ module P2p2
 
       # 取写前
       if @tund_info[ :caches ].any?
-        dst_local_port, pack_id, data = @tund_info[ :caches ].first
-        from = :caches
+        datas = @tund_info[ :caches ]
       elsif @tund_info[ :chunks ].any?
         path = File.join( @tund_chunk_dir, @tund_info[ :chunks ].shift )
 
@@ -613,48 +616,39 @@ module P2p2
           data = data[ ( 12 + pack_size )..-1 ]
         end
 
-        @tund_info[ :caches ] = caches
-        dst_local_port, pack_id, data = caches.first
-        from = :caches
+        datas = @tund_info[ :caches ] = caches
       elsif @tund_info[ :wbuffs ].any?
-        dst_local_port, pack_id, data = @tund_info[ :wbuffs ].first
-        from = :wbuffs
+        datas = @tund_info[ :wbuffs ]
       else
         @writes.delete( tund )
         return
       end
 
-      dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
+      while datas.any?
+        dst_local_port, pack_id, data = datas.first
+        dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
 
-      if dst_ext
-        if pack_id <= CONFUSE_UNTIL
-          data = @custom.encode( data )
-          # puts "debug1 encoded pack #{ pack_id }"
+        if dst_ext
+          if pack_id <= CONFUSE_UNTIL
+            data = @custom.encode( data )
+            # puts "debug1 encoded pack #{ pack_id }"
+          end
+
+          data = [ [ pack_id, dst_local_port ].pack( 'Q>n' ), data ].join
+
+          unless send_data( tund, data, @tund_info[ :tun_addr ] )
+            return
+          end
+
+          # puts "debug2 written pack #{ pack_id }"
+          dst_ext[ :relay_pack_id ] = pack_id
+          dst_ext[ :wmems ][ pack_id ] = data
+          dst_ext[ :send_ats ][ pack_id ] = now
+          dst_ext[ :last_continue_at ] = now
         end
 
-        data = [ [ pack_id, dst_local_port ].pack( 'Q>n' ), data ].join
-
-        begin
-          tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
-        rescue IO::WaitWritable, Errno::EINTR
-          return
-        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-          puts "#{ Time.new } #{ e.class }, close tund"
-          close_tund( tund )
-          sleep HEARTBEAT_INTERVAL
-          new_a_tund
-          return
-        end
-
-        # puts "debug2 written pack #{ pack_id }"
-        now = Time.new
-        dst_ext[ :relay_pack_id ] = pack_id
-        dst_ext[ :wmems ][ pack_id ] = data
-        dst_ext[ :send_ats ][ pack_id ] = now
-        dst_ext[ :last_continue_at ] = now
+        datas.shift
       end
-
-      @tund_info[ from ].shift
     end
 
     ##

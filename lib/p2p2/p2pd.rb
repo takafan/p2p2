@@ -5,7 +5,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2pd - 内网里的任意应用，访问另一个内网里的应用服务端。配对服务器端。
+# P2p2::P2pd - 配对服务。
 #
 # 包结构
 # ======

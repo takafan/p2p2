@@ -403,6 +403,23 @@ module P2p2
     end
 
     ##
+    # send data
+    #
+    def send_data( tun, data, to_addr )
+      begin
+        tun.sendmsg( data, 0, to_addr )
+      rescue IO::WaitWritable, Errno::EINTR
+        return false
+      rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH, Errno::ENETDOWN => e
+        puts "#{ Time.new } #{ e.class }, close tun"
+        close_tun( tun )
+        return false
+      end
+
+      true
+    end
+
+    ##
     # close src
     #
     def close_src( src )
@@ -503,15 +520,14 @@ module P2p2
     #
     def write_src( src )
       src_info = @src_infos[ src ]
-      data = src_info[ :cache ]
-      from = :cache
+      from, data = :cache, src_info[ :cache ]
 
       if data.empty?
         if src_info[ :chunks ].any?
           path = File.join( @src_chunk_dir, src_info[ :chunks ].shift )
 
           begin
-            src_info[ :cache ] = data = IO.binread( path )
+            data = src_info[ :cache ] = IO.binread( path )
             File.delete( path )
           rescue Errno::ENOENT => e
             puts "#{ Time.new } read #{ path } #{ e.class }"
@@ -519,8 +535,7 @@ module P2p2
             return
           end
         else
-          data = src_info[ :wbuff ]
-          from = :wbuff
+          from, data = :wbuff, src_info[ :wbuff ]
         end
       end
 
@@ -558,17 +573,13 @@ module P2p2
         return
       end
 
+      now = Time.new
+
       # 传ctlmsg
       while @tun_info[ :ctlmsgs ].any?
         to_addr, data = @tun_info[ :ctlmsgs ].first
 
-        begin
-          tun.sendmsg( data, 0, to_addr )
-        rescue IO::WaitWritable, Errno::EINTR
-          return
-        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-          puts "#{ Time.new } #{ e.class }, close tun"
-          close_tun( tun )
+        unless send_data( tun, data, to_addr )
           return
         end
 
@@ -584,20 +595,15 @@ module P2p2
           data = src_ext[ :wmems ][ pack_id ]
 
           if data
-            begin
-              tun.sendmsg( data, 0, @tun_info[ :tund_addr ] )
-            rescue IO::WaitWritable, Errno::EINTR
-              return
-            rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-              puts "#{ Time.new } #{ e.class }, close tun"
-              close_tun( tun )
+            unless send_data( tun, data, @tun_info[ :tund_addr ] )
               return
             end
+
+            src_ext[ :last_continue_at ] = now
           end
         end
 
         @tun_info[ :resendings ].shift
-        return
       end
 
       # 若写后达到上限，暂停取写前
@@ -613,8 +619,7 @@ module P2p2
 
       # 取写前
       if @tun_info[ :caches ].any?
-        src_id, pack_id, data = @tun_info[ :caches ].first
-        from = :caches
+        datas = @tun_info[ :caches ]
       elsif @tun_info[ :chunks ].any?
         path = File.join( @tun_chunk_dir, @tun_info[ :chunks ].shift )
 
@@ -635,46 +640,39 @@ module P2p2
           data = data[ ( 18 + pack_size )..-1 ]
         end
 
-        @tun_info[ :caches ] = caches
-        src_id, pack_id, data = caches.first
-        from = :caches
+        datas = @tun_info[ :caches ] = caches
       elsif @tun_info[ :wbuffs ].any?
-        src_id, pack_id, data = @tun_info[ :wbuffs ].first
-        from = :wbuffs
+        datas = @tun_info[ :wbuffs ]
       else
         @writes.delete( tun )
         return
       end
 
-      src_ext = @tun_info[ :src_exts ][ src_id ]
+      while datas.any?
+        src_id, pack_id, data = datas.first
+        src_ext = @tun_info[ :src_exts ][ src_id ]
 
-      if src_ext
-        if pack_id <= CONFUSE_UNTIL
-          data = @custom.encode( data )
-          # puts "debug1 encoded pack #{ pack_id }"
+        if src_ext
+          if pack_id <= CONFUSE_UNTIL
+            data = @custom.encode( data )
+            # puts "debug1 encoded pack #{ pack_id }"
+          end
+
+          data = [ [ pack_id, src_id ].pack( 'Q>Q>' ), data ].join
+
+          unless send_data( tun, data, @tun_info[ :tund_addr ] )
+            return
+          end
+
+          # puts "debug2 written pack #{ pack_id }"
+          src_ext[ :relay_pack_id ] = pack_id
+          src_ext[ :wmems ][ pack_id ] = data
+          src_ext[ :send_ats ][ pack_id ] = now
+          src_ext[ :last_continue_at ] = now
         end
 
-        data = [ [ pack_id, src_id ].pack( 'Q>Q>' ), data ].join
-
-        begin
-          tun.sendmsg( data, 0, @tun_info[ :tund_addr ] )
-        rescue IO::WaitWritable, Errno::EINTR
-          return
-        rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH => e
-          puts "#{ Time.new } #{ e.class }, close tun"
-          close_tun( tun )
-          return
-        end
-
-        # puts "debug2 written pack #{ pack_id }"
-        now = Time.new
-        src_ext[ :relay_pack_id ] = pack_id
-        src_ext[ :wmems ][ pack_id ] = data
-        src_ext[ :send_ats ][ pack_id ] = now
-        src_ext[ :last_continue_at ] = now
+        datas.shift
       end
-
-      @tun_info[ from ].shift
     end
 
     ##

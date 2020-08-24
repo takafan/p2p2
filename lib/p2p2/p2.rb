@@ -6,7 +6,7 @@ require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2 - 内网里的任意应用，访问另一个内网里的应用服务端。p2端。
+# P2p2::P2 - p2p通道，p2端。
 #
 module P2p2
   class P2
