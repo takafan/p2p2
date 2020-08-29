@@ -90,7 +90,7 @@ module P2p2
             now = Time.new
 
             unless @tund.closed?
-              if @tund_info[ :peer_addr ]
+              if @tund_info[ :peer_addr ] && @tund_info[ :peer_at ]
                 if @tund_info[ :tun_addr ]
                   if now - check_at >= CHECK_EXPIRE_INTERVAL
                     if now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER
@@ -118,8 +118,7 @@ module P2p2
                   # puts "debug2 heartbeat"
                   add_tund_ctlmsg( pack_a_heartbeat )
                   next_tick
-                elsif now - @tund_info[ :created_at ] > EXPIRE_NEW
-                  # no tun addr
+                elsif now - @tund_info[ :peer_at ] > EXPIRE_NEW
                   puts "#{ Time.new } expire new tund"
                   set_is_closing( @tund )
                   next_tick
@@ -221,7 +220,8 @@ module P2p2
         caches: [],           # 块读出缓存 [ dst_local_port, pack_id, data ]
         chunks: [],           # 块队列 filename
         spring: 0,            # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-        peer_addr: nil,       # 对面地址
+        peer_addr: nil,       # 配对地址
+        peer_at: nil,         # 收到配对地址时间
         tun_addr: nil,        # 连通后的tun地址
         dst_exts: {},         # dst额外信息 dst_local_port => {}
         dst_local_ports: {},  # src_id => dst_local_port
@@ -706,6 +706,7 @@ module P2p2
           puts "#{ Time.new } got peer addr #{ Addrinfo.new( peer_addr ).inspect }"
 
           @tund_info[ :peer_addr ] = peer_addr
+          @tund_info[ :peer_at ] = now
           loop_punch_peer
         when HEARTBEAT
           from_addr = addrinfo.to_sockaddr
