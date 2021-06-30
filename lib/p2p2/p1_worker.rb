@@ -4,23 +4,18 @@ module P2p2
     ##
     # initialize
     #
-    def initialize( p2pd_host, p2pd_port, room, appd_host, appd_port, dst_chunk_dir, tund_chunk_dir )
-      @p2pd_addr = Socket.sockaddr_in( p2pd_port, p2pd_host )
-      @room = room
+    def initialize( paird_host, paird_port, title, appd_host, appd_port )
+      @paird_host = paird_host
+      @paird_port = paird_port
+      @title = title
       @appd_addr = Socket.sockaddr_in( appd_port, appd_host )
-      @dst_chunk_dir = dst_chunk_dir
-      @tund_chunk_dir = tund_chunk_dir
-      @custom = P2p2::P1Custom.new
-      @mutex = Mutex.new
       @reads = []
       @writes = []
-      @roles = {}     # sock => :dotr / :dst / :tund
-      @dst_infos = {} # dst => {}
+      @roles = {} # sock => :dotr / :ctl / :tun / :dst
+      @renew_times = 0
 
-      dotr, dotw = IO.pipe
-      @dotw = dotw
-      add_read( dotr, :dotr )
-      new_a_tund
+      new_a_pipe
+      new_a_ctl
     end
 
     ##
@@ -28,32 +23,41 @@ module P2p2
     #
     def looping
       puts "#{ Time.new } looping"
-      loop_heartbeat
-      loop_check_status
+      loop_send_title
+      loop_check_state
 
       loop do
         rs, ws = IO.select( @reads, @writes )
 
-        @mutex.synchronize do
-          # 先写，再读
-          ws.each do | sock |
-            case @roles[ sock ]
-            when :dst
-              write_dst( sock )
-            when :tund
-              write_tund( sock )
-            end
-          end
+        rs.each do | sock |
+          role = @roles[ sock ]
 
-          rs.each do | sock |
-            case @roles[ sock ]
-            when :dotr
-              read_dotr( sock )
-            when :dst
-              read_dst( sock )
-            when :tund
-              read_tund( sock )
-            end
+          case role
+          when :dotr then
+            read_dotr( sock )
+          when :ctl then
+            read_ctl( sock )
+          when :tun then
+            read_tun( sock )
+          when :dst then
+            read_dst( sock )
+          else
+            puts "#{ Time.new } read unknown role #{ role }"
+            close_sock( sock )
+          end
+        end
+
+        ws.each do | sock |
+          role = @roles[ sock ]
+
+          case role
+          when :tun then
+            write_tun( sock )
+          when :dst then
+            write_dst( sock )
+          else
+            puts "#{ Time.new } write unknown role #{ role }"
+            close_sock( sock )
           end
         end
       end
@@ -66,387 +70,153 @@ module P2p2
     # quit!
     #
     def quit!
-      if !@tund.closed? && @tund_info[ :tun_addr ]
-        # puts "debug1 send tund fin"
-        data = [ 0, TUND_FIN ].pack( 'Q>C' )
-        @tund.sendmsg( data, 0, @tund_info[ :tun_addr ] )
-      end
-
-      # puts "debug1 exit"
+      # puts "debug exit"
       exit
     end
 
     private
 
     ##
-    # loop heartbeat
+    # add dst rbuff
     #
-    def loop_heartbeat( check_at = Time.new )
-      Thread.new do
-        loop do
-          sleep HEARTBEAT_INTERVAL
+    def add_dst_rbuff( data )
+      return if @dst.nil? || @dst.closed?
+      @dst_info[ :rbuff ] << data
 
-          @mutex.synchronize do
-            now = Time.new
-
-            unless @tund.closed?
-              if @tund_info[ :peer_addr ] && @tund_info[ :peer_at ]
-                if @tund_info[ :tun_addr ]
-                  if now - check_at >= CHECK_EXPIRE_INTERVAL
-                    if now - @tund_info[ :last_recv_at ] > EXPIRE_AFTER
-                      puts "#{ Time.new } expire tund"
-                      set_is_closing( @tund )
-                    else
-                      @tund_info[ :dst_exts ].each do | dst_local_port, dst_ext |
-                        if dst_ext[ :dst ].closed? && ( now - dst_ext[ :last_continue_at ] > EXPIRE_AFTER )
-                          puts "#{ Time.new } expire dst ext"
-                          del_dst_ext( dst_local_port )
-                        end
-                      end
-                    end
-
-                    @dst_infos.each do | dst, dst_info |
-                      if now - dst_info[ :last_continue_at ] > EXPIRE_AFTER
-                        puts "#{ Time.new } expire dst"
-                        set_is_closing( dst )
-                      end
-                    end
-
-                    check_at = now
-                  end
-
-                  # puts "debug2 heartbeat"
-                  add_tund_ctlmsg( pack_a_heartbeat )
-                  next_tick
-                elsif now - @tund_info[ :peer_at ] > EXPIRE_NEW
-                  puts "#{ Time.new } expire new tund"
-                  set_is_closing( @tund )
-                  next_tick
-                end
-              else
-                # no peer addr
-                if now - check_at >= UPDATE_ROOM_INTERVAL
-                  data = @room
-                  check_at = now
-                else
-                  data = [ rand( 128 ) ].pack( 'C' )
-                end
-
-                # puts "debug2 update room"
-                add_tund_ctlmsg( data, @p2pd_addr )
-                next_tick
-              end
-            end
-          end
-        end
+      if @dst_info[ :rbuff ].bytesize >= WBUFF_LIMIT then
+        # puts "debug dst.rbuff full"
+        close_dst
       end
-    end
-
-    ##
-    # loop check status
-    #
-    def loop_check_status
-      Thread.new do
-        loop do
-          sleep STATUS_INTERVAL
-
-          @mutex.synchronize do
-            if !@tund.closed? && @tund_info[ :tun_addr ]
-              need_trigger = false
-
-              if @tund_info[ :dst_exts ].any?
-                now = Time.new
-
-                @tund_info[ :dst_exts ].each do | dst_local_port, dst_ext |
-                  if now - dst_ext[ :last_continue_at ] < SEND_STATUS_UNTIL
-                    data = [ 0, DEST_STATUS, dst_local_port, dst_ext[ :relay_pack_id ], dst_ext[ :continue_src_pack_id ] ].pack( 'Q>CnQ>Q>' )
-                    add_tund_ctlmsg( data )
-                    need_trigger = true
-                  end
-                end
-              end
-
-              if @tund_info[ :paused ] && ( @tund_info[ :dst_exts ].map{ | _, dst_ext | dst_ext[ :wmems ].size }.sum < RESUME_BELOW )
-                puts "#{ Time.new } resume tund"
-                @tund_info[ :paused ] = false
-                add_write( @tund )
-                need_trigger = true
-              end
-
-              if need_trigger
-                next_tick
-              end
-            end
-          end
-        end
-      end
-    end
-
-    ##
-    # loop punch peer
-    #
-    def loop_punch_peer
-      Thread.new do
-        EXPIRE_NEW.times do
-          if @tund.closed?
-            # puts "debug1 break loop punch peer"
-            break
-          end
-
-          @mutex.synchronize do
-            # puts "debug1 punch peer"
-            add_tund_ctlmsg( pack_a_heartbeat, @tund_info[ :peer_addr ] )
-            next_tick
-          end
-
-          sleep 1
-        end
-      end
-    end
-
-    ##
-    # new a tund
-    #
-    def new_a_tund
-      tund = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
-      tund.bind( Socket.sockaddr_in( 0, '0.0.0.0' ) )
-      port = tund.local_address.ip_port
-      puts "#{ Time.new } tund bind on #{ port }"
-
-      tund_info = {
-        port: port,           # 端口
-        ctlmsgs: [],          # [ to_addr, data ]
-        wbuffs: [],           # 写前缓存 [ dst_local_port, pack_id, data ]
-        caches: [],           # 块读出缓存 [ dst_local_port, pack_id, data ]
-        chunks: [],           # 块队列 filename
-        spring: 0,            # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-        peer_addr: nil,       # 配对地址
-        peer_at: nil,         # 收到配对地址时间
-        tun_addr: nil,        # 连通后的tun地址
-        dst_exts: {},         # dst额外信息 dst_local_port => {}
-        dst_local_ports: {},  # src_id => dst_local_port
-        paused: false,        # 是否暂停写
-        resendings: [],       # 重传队列 [ dst_local_port, pack_id ]
-        created_at: Time.new, # 创建时间
-        last_recv_at: nil,    # 上一次收到流量的时间，过期关闭
-        is_closing: false     # 是否准备关闭
-      }
-
-      @tund = tund
-      @tund_info = tund_info
-      add_read( tund, :tund )
-      add_tund_ctlmsg( @room, @p2pd_addr )
-    end
-
-    ##
-    # pack a heartbeat
-    #
-    def pack_a_heartbeat
-      [ 0, HEARTBEAT, rand( 128 ) ].pack( 'Q>CC' )
-    end
-
-    ##
-    # is match tun addr
-    #
-    def is_match_tun_addr( addrinfo )
-      return false unless @tund_info[ :tun_addr ]
-
-      from_addr = addrinfo.to_sockaddr
-
-      if from_addr != @tund_info[ :tun_addr ]
-        puts "#{ Time.new } #{ addrinfo.inspect } not match #{ Addrinfo.new( @tund_info[ :tun_addr ] ).inspect }"
-        return false
-      end
-
-      @tund_info[ :last_recv_at ] = Time.new
-
-      true
-    end
-
-    ##
-    # add tund ctlmsg
-    #
-    def add_tund_ctlmsg( data, to_addr = nil )
-      unless to_addr
-        to_addr = @tund_info[ :tun_addr ]
-      end
-
-      if to_addr
-        @tund_info[ :ctlmsgs ] << [ to_addr, data ]
-        add_write( @tund )
-      end
-    end
-
-    ##
-    # add tund wbuff
-    #
-    def add_tund_wbuff( dst_local_port, pack_id, data )
-      @tund_info[ :wbuffs ] << [ dst_local_port, pack_id, data ]
-
-      if @tund_info[ :wbuffs ].size >= WBUFFS_LIMIT
-        spring = @tund_info[ :chunks ].size > 0 ? ( @tund_info[ :spring ] + 1 ) : 0
-        filename = "#{ Process.pid }-#{ @tund_info[ :port ] }.#{ spring }"
-        chunk_path = File.join( @tund_chunk_dir, filename )
-        datas = @tund_info[ :wbuffs ].map{ | _dst_local_port, _pack_id, _data | [ [ _dst_local_port, _pack_id, _data.bytesize ].pack( 'nQ>n' ), _data ].join }
-
-        begin
-          IO.binwrite( chunk_path, datas.join )
-        rescue Errno::ENOSPC => e
-          puts "#{ Time.new } #{ e.class }, close tund"
-          set_is_closing( @tund )
-          return
-        end
-
-        @tund_info[ :chunks ] << filename
-        @tund_info[ :spring ] = spring
-        @tund_info[ :wbuffs ].clear
-      end
-
-      add_write( @tund )
     end
 
     ##
     # add dst wbuff
     #
-    def add_dst_wbuff( dst, data )
-      dst_info = @dst_infos[ dst ]
-      dst_info[ :wbuff ] << data
+    def add_dst_wbuff( data )
+      return if @dst.nil? || @dst.closed?
+      @dst_info[ :wbuff ] << data
+      add_write( @dst )
 
-      if dst_info[ :wbuff ].bytesize >= CHUNK_SIZE
-        spring = dst_info[ :chunks ].size > 0 ? ( dst_info[ :spring ] + 1 ) : 0
-        filename = "#{ Process.pid }-#{ dst_info[ :local_port ] }.#{ spring }"
-        chunk_path = File.join( @dst_chunk_dir, filename )
-
-        begin
-          IO.binwrite( chunk_path, dst_info[ :wbuff ] )
-        rescue Errno::ENOSPC => e
-          puts "#{ Time.new } #{ e.class }, close dst"
-          set_is_closing( dst )
-          return
-        end
-
-        dst_info[ :chunks ] << filename
-        dst_info[ :spring ] = spring
-        dst_info[ :wbuff ].clear
+      if ( @dst_info[ :wbuff ].bytesize >= WBUFF_LIMIT ) && @tun && !@tun.closed? then
+        puts "#{ Time.new } pause tun"
+        @reads.delete( @tun )
+        @tun_info[ :paused ] = true
       end
-
-      add_write( dst )
     end
 
     ##
     # add read
     #
-    def add_read( sock, role )
-      unless @reads.include?( sock )
-        @reads << sock
-      end
+    def add_read( sock, role = nil )
+      return if sock.nil? || sock.closed? || @reads.include?( sock )
+      @reads << sock
 
-      @roles[ sock ] = role
+      if role then
+        @roles[ sock ] = role
+      end
+    end
+
+    ##
+    # add tun wbuff
+    #
+    def add_tun_wbuff( data )
+      return if @tun.nil? || @tun.closed?
+      @tun_info[ :wbuff ] << data
+      add_write( @tun )
+
+      if ( @tun_info[ :wbuff ].bytesize >= WBUFF_LIMIT ) && @dst && !@dst.closed? then
+        puts "#{ Time.new } pause dst"
+        @reads.delete( @dst )
+        @dst_info[ :paused ] = true
+      end
     end
 
     ##
     # add write
     #
     def add_write( sock )
-      if sock && !sock.closed? && !@writes.include?( sock )
-        @writes << sock
-      end
+      return if sock.nil? || sock.closed? || @writes.include?( sock )
+      @writes << sock
     end
 
     ##
-    # set is closing
+    # clean dst info
     #
-    def set_is_closing( sock )
-      if sock && !sock.closed?
-        role = @roles[ sock ]
-        # puts "debug1 set #{ role.to_s } is closing"
-
-        case role
-        when :dst
-          dst_info = @dst_infos[ sock ]
-          dst_info[ :is_closing ] = true
-        when :tund
-          @tund_info[ :is_closing ] = true
-        end
-
-        @reads.delete( sock )
-        add_write( sock )
-      end
+    def clean_dst_info
+      @dst_info[ :rbuff ].clear
+      @dst_info[ :wbuff ].clear
+      @dst_info[ :closing_write ] = false
+      @dst_info[ :paused ] = false
     end
 
     ##
-    # send data
+    # clean tun info
     #
-    def send_data( tund, data, to_addr )
-      begin
-        tund.sendmsg( data, 0, to_addr )
-      rescue IO::WaitWritable, Errno::EINTR
-        return false
-      rescue Errno::EHOSTUNREACH, Errno::ENETUNREACH, Errno::ENETDOWN => e
-        puts "#{ Time.new } #{ e.class }, close tund"
-        close_tund( tund )
-        sleep HEARTBEAT_INTERVAL
-        new_a_tund
-        return false
-      end
+    def clean_tun_info
+      @tun_info[ :connected ] = false
+      @tun_info[ :wbuff ].clear
+      @tun_info[ :closing_write ] = false
+      @tun_info[ :paused ] = false
+    end
 
-      true
+    ##
+    # close ctl
+    #
+    def close_ctl
+      return if @ctl.nil? || @ctl.closed?
+      puts "#{ Time.new } close ctl"
+      close_sock( @ctl )
     end
 
     ##
     # close dst
     #
-    def close_dst( dst )
-      # puts "debug1 close dst"
-      close_sock( dst )
-      dst_info = @dst_infos.delete( dst )
+    def close_dst
+      return if @dst.nil? || @dst.closed?
+      puts "#{ Time.new } close dst"
+      close_sock( @dst )
+      clean_dst_info
+    end
 
-      dst_info[ :chunks ].each do | filename |
-        begin
-          File.delete( File.join( @dst_chunk_dir, filename ) )
-        rescue Errno::ENOENT
-        end
-      end
+    ##
+    # close read dst
+    #
+    def close_read_dst
+      return if @dst.nil? || @dst.closed?
+      # puts "debug close read dst"
+      @dst.close_read
+      @reads.delete( @dst )
 
-      return if @tund.closed?
-
-      local_port = dst_info[ :local_port ]
-      dst_ext = @tund_info[ :dst_exts ][ local_port ]
-      return unless dst_ext
-
-      if dst_ext[ :is_src_closed ]
-        # puts "debug1 4-3. after close dst -> src closed ? yes -> del dst ext -> send fin2"
-        del_dst_ext( local_port )
-        data = [ 0, FIN2, local_port ].pack( 'Q>Cn' )
-        add_tund_ctlmsg( data )
-      else
-        # puts "debug1 3-1. after close dst -> src closed ? no -> send fin1"
-        data = [ 0, FIN1, local_port, dst_info[ :biggest_pack_id ], dst_ext[ :continue_src_pack_id ] ].pack( 'Q>CnQ>Q>' )
-        add_tund_ctlmsg( data )
+      if @dst.closed? then
+        # puts "debug dst closed"
+        @writes.delete( @dst )
+        @roles.delete( @dst )
+        clean_dst_info
       end
     end
 
     ##
-    # close tund
+    # close read tun
     #
-    def close_tund( tund )
-      # puts "debug1 close tund"
-      close_sock( tund )
+    def close_read_tun
+      return if @tun.nil? || @tun.closed?
+      # puts "debug close read tun"
+      @tun.close_read
+      @reads.delete( @tun )
 
-      @tund_info[ :chunks ].each do | filename |
-        begin
-          File.delete( File.join( @tund_chunk_dir, filename ) )
-        rescue Errno::ENOENT
-        end
+      if @tun.closed? then
+        # puts "debug tun closed"
+        @writes.delete( @tun )
+        @roles.delete( @tun )
+        clean_tun_info
       end
-
-      @tund_info[ :dst_exts ].each{ | _, dst_ext | set_is_closing( dst_ext[ :dst ] ) }
     end
 
     ##
     # close sock
     #
     def close_sock( sock )
+      return if sock.nil? || sock.closed?
       sock.close
       @reads.delete( sock )
       @writes.delete( sock )
@@ -454,32 +224,185 @@ module P2p2
     end
 
     ##
-    # del dst ext
+    # close tun
     #
-    def del_dst_ext( dst_local_port )
-      dst_ext = @tund_info[ :dst_exts ].delete( dst_local_port )
+    def close_tun
+      return if @tun.nil? || @tun.closed?
+      puts "#{ Time.new } close tun"
+      close_sock( @tun )
+      clean_tun_info
+    end
 
-      if dst_ext
-        @tund_info[ :dst_local_ports ].delete( dst_ext[ :src_id ] )
+    ##
+    # close write dst
+    #
+    def close_write_dst
+      return if @dst.nil? || @dst.closed?
+      # puts "debug close write dst"
+      @dst.close_write
+      @writes.delete( @dst )
+
+      if @dst.closed? then
+        # puts "debug dst closed"
+        @reads.delete( @dst )
+        @roles.delete( @dst )
+        clean_dst_info
       end
     end
 
     ##
-    # release wmems
+    # close write tun
     #
-    def release_wmems( dst_ext, completed_pack_id )
-      if completed_pack_id > dst_ext[ :completed_pack_id ]
-        # puts "debug2 update completed pack #{ completed_pack_id }"
+    def close_write_tun
+      return if @tun.nil? || @tun.closed?
+      # puts "debug close write tun"
+      @tun.close_write
+      @writes.delete( @tun )
 
-        pack_ids = dst_ext[ :wmems ].keys.select { | pack_id | pack_id <= completed_pack_id }
-
-        pack_ids.each do | pack_id |
-          dst_ext[ :wmems ].delete( pack_id )
-          dst_ext[ :send_ats ].delete( pack_id )
-        end
-
-        dst_ext[ :completed_pack_id ] = completed_pack_id
+      if @tun.closed? then
+        # puts "debug tun closed"
+        @reads.delete( @tun )
+        @roles.delete( @tun )
+        clean_tun_info
       end
+    end
+
+    ##
+    # loop check state
+    #
+    def loop_check_state
+      Thread.new do
+        loop do
+          sleep CHECK_STATE_INTERVAL
+
+          if @dst && @dst_info[ :paused ] && @tun && ( @tun_info[ :wbuff ].size < RESUME_BELOW ) then
+            puts "#{ Time.new } resume dst"
+            add_read( @dst )
+            @dst_info[ :paused ] = false
+            next_tick
+          end
+
+          if @tun && @tun_info[ :paused ] && @dst && ( @dst_info[ :wbuff ].size < RESUME_BELOW ) then
+            puts "#{ Time.new } resume tun"
+            add_read( @tun )
+            @tun_info[ :paused ] = false
+            next_tick
+          end
+        end
+      end
+    end
+
+    ##
+    # loop send title
+    #
+    def loop_send_title
+      Thread.new do
+        loop do
+          sleep SEND_TITLE_INTERVAL
+
+          if @tun && !@tun.closed? then
+            send_title
+          else
+            set_ctl_closing
+          end
+        end
+      end
+    end
+
+    ##
+    # new a ctl
+    #
+    def new_a_ctl
+      ctl = Socket.new( Socket::AF_INET, Socket::SOCK_DGRAM, 0 )
+      ctl.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEADDR, 1 )
+
+      if RUBY_PLATFORM.include?( 'linux' ) then
+        ctl.setsockopt( Socket::SOL_SOCKET, Socket::SO_REUSEPORT, 1 )
+      end
+
+      paird_port = @paird_port + 10.times.to_a.sample
+      paird_addr = Socket.sockaddr_in( paird_port, @paird_host )
+
+      @ctl = ctl
+      @ctl_info = {
+        paird_addr: paird_addr,
+        peer_addr: nil,
+        closing: false
+      }
+
+      add_read( ctl, :ctl )
+
+      puts "#{ Time.new } hello i'm #{ @title.inspect } #{ Addrinfo.new( @ctl_info[ :paird_addr ] ).inspect }"
+      send_title
+    end
+
+    ##
+    # new a dst
+    #
+    def new_a_dst
+      dst = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
+      dst.setsockopt( Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1 )
+
+      begin
+        dst.connect_nonblock( @appd_addr )
+      rescue IO::WaitWritable
+      rescue Exception => e
+        puts "#{ Time.new } dst connect appd addr #{ e.class }"
+        dst.close
+        renew_ctl
+        return
+      end
+
+      @dst = dst
+      @dst_info = {
+        rbuff: '',
+        wbuff: '',
+        closing_write: false,
+        paused: false
+      }
+
+      add_read( dst, :dst )
+    end
+
+    ##
+    # new a pipe
+    #
+    def new_a_pipe
+      dotr, dotw = IO.pipe
+      @dotw = dotw
+      add_read( dotr, :dotr )
+    end
+
+    ##
+    # new a tun
+    #
+    def new_a_tun
+      return if @ctl.nil? || @ctl.closed? || @ctl_info[ :peer_addr ].nil?
+      tun = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
+      tun.setsockopt( Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1 )
+      puts "#{ Time.new } bind ctl local address #{ @ctl.local_address.inspect } connect #{ Addrinfo.new( @ctl_info[ :peer_addr ] ).inspect }"
+      tun.bind( @ctl.local_address )
+
+      begin
+        tun.connect_nonblock( @ctl_info[ :peer_addr ] )
+      rescue IO::WaitWritable
+      rescue Exception => e
+        puts "#{ Time.new } tun connect ctl addr #{ e.class }"
+        tun.close
+        renew_ctl
+        return
+      end
+
+      @tun = tun
+      @tun_info = {
+        connected: false,
+        wbuff: '',
+        closing_write: false,
+        paused: false
+      }
+
+      add_read( tun, :tun )
+      add_write( tun )
     end
 
     ##
@@ -490,32 +413,246 @@ module P2p2
     end
 
     ##
+    # renew ctl
+    #
+    def renew_ctl
+      # puts "debug renew ctl"
+      close_ctl
+      new_a_ctl
+    end
+
+    ##
+    # renew dst
+    #
+    def renew_dst
+      close_dst
+      new_a_dst
+    end
+
+    ##
+    # renew paired ctl
+    #
+    def renew_paired_ctl
+      if @ctl && !@ctl.closed? && @ctl_info[ :peer_addr ] then
+        puts "#{ Time.new } renew paired ctl"
+        renew_ctl
+      end
+    end
+
+    ##
+    # renew tun
+    #
+    def renew_tun
+      close_tun
+      new_a_tun
+    end
+
+    ##
+    # send title
+    #
+    def send_title
+      # puts "debug send title #{ @title } #{ Addrinfo.new( @ctl_info[ :paird_addr ] ).inspect } #{ Time.new }"
+
+      begin
+        @ctl.sendmsg_nonblock( @title, 0, @ctl_info[ :paird_addr ] )
+      rescue Exception => e
+        puts "#{ Time.new } ctl sendmsg #{ e.class }"
+        set_ctl_closing
+      end
+    end
+
+    ##
+    # set ctl closing
+    #
+    def set_ctl_closing
+      return if @ctl.nil? || @ctl.closed? || @ctl_info[ :closing ]
+      @ctl_info[ :closing ] = true
+      next_tick
+    end
+
+    ##
+    # set dst closing write
+    #
+    def set_dst_closing_write
+      return if @dst.nil? || @dst.closed? || @dst_info[ :closing_write ]
+      @dst_info[ :closing_write ] = true
+      add_write( @dst )
+    end
+
+    ##
+    # set tun closing write
+    #
+    def set_tun_closing_write
+      return if @tun.nil? || @tun.closed? || @tun_info[ :closing_write ]
+      @tun_info[ :closing_write ] = true
+      add_write( @tun )
+    end
+
+    ##
+    # read dotr
+    #
+    def read_dotr( dotr )
+      dotr.read_nonblock( READ_SIZE )
+
+      if @ctl && !@ctl.closed? && @ctl_info[ :closing ] then
+        renew_ctl
+      end
+    end
+
+    ##
+    # read ctl
+    #
+    def read_ctl( ctl )
+      if ctl.closed? then
+        puts "#{ Time.new } read ctl but ctl closed?"
+        return
+      end
+
+      data, addrinfo, rflags, *controls = ctl.recvmsg
+
+      if @ctl_info[ :peer_addr ] then
+        puts "#{ Time.new } peer addr already exist"
+        return
+      end
+
+      if addrinfo.to_sockaddr != @ctl_info[ :paird_addr ] then
+        puts "#{ Time.new } paird addr not match #{ addrinfo.inspect } #{ Addrinfo.new( @ctl_info[ :paird_addr ] ).inspect }"
+        return
+      end
+
+      puts "#{ Time.new } read ctl #{ data.inspect }"
+      @ctl_info[ :peer_addr ] = data
+      renew_tun
+      renew_dst
+      @renew_times = 0
+    end
+
+    ##
+    # read tun
+    #
+    def read_tun( tun )
+      if tun.closed? then
+        puts "#{ Time.new } read tun but tun closed?"
+        return
+      end
+
+      begin
+        data = tun.read_nonblock( READ_SIZE )
+      rescue Errno::ECONNREFUSED => e
+        if @renew_times >= RENEW_LIMIT then
+          puts "#{ Time.new } out of limit"
+          close_tun
+          close_dst
+          renew_ctl
+          return
+        end
+
+        puts "#{ Time.new } read tun #{ e.class } #{ @renew_times }"
+        renew_tun
+        @renew_times += 1
+        return
+      rescue Exception => e
+        puts "#{ Time.new } read tun #{ e.class }"
+        close_read_tun
+        set_dst_closing_write
+        renew_paired_ctl
+        return
+      end
+
+      add_dst_wbuff( data )
+    end
+
+    ##
+    # read dst
+    #
+    def read_dst( dst )
+      if dst.closed? then
+        puts "#{ Time.new } read dst but dst closed?"
+        return
+      end
+
+      begin
+        data = dst.read_nonblock( READ_SIZE )
+      rescue Exception => e
+        puts "#{ Time.new } read dst #{ e.class }"
+        close_read_dst
+        set_tun_closing_write
+        renew_paired_ctl
+        return
+      end
+
+      if @tun && !@tun.closed? && @tun_info[ :connected ] then
+        add_tun_wbuff( data )
+      else
+        # puts "debug tun not ready, save data to dst.rbuff #{ data.inspect }"
+        add_dst_rbuff( data )
+      end
+    end
+
+    ##
+    # write tun
+    #
+    def write_tun( tun )
+      if tun.closed? then
+        puts "#{ Time.new } write tun but tun closed?"
+        return
+      end
+
+      unless @tun_info[ :connected ] then
+        puts "#{ Time.new } connected"
+        @tun_info[ :connected ] = true
+
+        if @dst && !@dst.closed? && !@dst_info[ :rbuff ].empty? then
+          # puts "debug move dst.rbuff to tun.wbuff"
+          @tun_info[ :wbuff ] << @dst_info[ :rbuff ]
+        end
+
+        renew_ctl
+      end
+
+      data = @tun_info[ :wbuff ]
+
+      # 写前为空，处理关闭写
+      if data.empty? then
+        if @tun_info[ :closing_write ] then
+          close_write_tun
+        else
+          @writes.delete( tun )
+        end
+
+        return
+      end
+
+      # 写入
+      begin
+        written = tun.write_nonblock( data )
+      rescue Exception => e
+        puts "#{ Time.new } write tun #{ e.class }"
+        close_write_tun
+        close_read_dst
+        renew_paired_ctl
+        return
+      end
+
+      data = data[ written..-1 ]
+      @tun_info[ :wbuff ] = data
+    end
+
+    ##
     # write dst
     #
     def write_dst( dst )
-      dst_info = @dst_infos[ dst ]
-      from, data = :cache, dst_info[ :cache ]
-
-      if data.empty?
-        if dst_info[ :chunks ].any?
-          path = File.join( @dst_chunk_dir, dst_info[ :chunks ].shift )
-
-          begin
-            data = dst_info[ :cache ] = IO.binread( path )
-            File.delete( path )
-          rescue Errno::ENOENT => e
-            puts "#{ Time.new } read #{ path } #{ e.class }"
-            close_dst( dst )
-            return
-          end
-        else
-          from, data = :wbuff, dst_info[ :wbuff ]
-        end
+      if dst.closed? then
+        puts "#{ Time.new } write dst but dst closed?"
+        return
       end
 
-      if data.empty?
-        if dst_info[ :is_closing ]
-          close_dst( dst )
+      data = @dst_info[ :wbuff ]
+
+      # 写前为空，处理关闭写
+      if data.empty? then
+        if @dst_info[ :closing_write ] then
+          close_write_dst
         else
           @writes.delete( dst )
         end
@@ -523,406 +660,19 @@ module P2p2
         return
       end
 
+      # 写入
       begin
         written = dst.write_nonblock( data )
-      rescue IO::WaitWritable, Errno::EINTR
-        return
       rescue Exception => e
-        # puts "debug1 write dst #{ e.class }"
-        close_dst( dst )
+        puts "#{ Time.new } write dst #{ e.class }"
+        close_write_dst
+        close_read_tun
+        renew_paired_ctl
         return
       end
 
-      # puts "debug2 write dst #{ written }"
       data = data[ written..-1 ]
-      dst_info[ from ] = data
-      dst_info[ :last_continue_at ] = Time.new
+      @dst_info[ :wbuff ] = data
     end
-
-    ##
-    # write tund
-    #
-    def write_tund( tund )
-      if @tund_info[ :is_closing ]
-        close_tund( tund )
-        new_a_tund
-        return
-      end
-
-      now = Time.new
-
-      # 传ctlmsg
-      while @tund_info[ :ctlmsgs ].any?
-        to_addr, data = @tund_info[ :ctlmsgs ].first
-
-        unless send_data( tund, data, to_addr )
-          return
-        end
-
-        @tund_info[ :ctlmsgs ].shift
-      end
-
-      # 重传
-      while @tund_info[ :resendings ].any?
-        dst_local_port, pack_id = @tund_info[ :resendings ].first
-        dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-
-        if dst_ext
-          data = dst_ext[ :wmems ][ pack_id ]
-
-          if data
-            unless send_data( tund, data, @tund_info[ :tun_addr ] )
-              return
-            end
-
-            dst_ext[ :last_continue_at ] = now
-          end
-        end
-
-        @tund_info[ :resendings ].shift
-      end
-
-      # 若写后达到上限，暂停取写前
-      if @tund_info[ :dst_exts ].map{ | _, dst_ext | dst_ext[ :wmems ].size }.sum >= WMEMS_LIMIT
-        unless @tund_info[ :paused ]
-          puts "#{ Time.new } pause tund #{ @tund_info[ :port ] }"
-          @tund_info[ :paused ] = true
-        end
-
-        @writes.delete( tund )
-        return
-      end
-
-      # 取写前
-      if @tund_info[ :caches ].any?
-        datas = @tund_info[ :caches ]
-      elsif @tund_info[ :chunks ].any?
-        path = File.join( @tund_chunk_dir, @tund_info[ :chunks ].shift )
-
-        begin
-          data = IO.binread( path )
-          File.delete( path )
-        rescue Errno::ENOENT => e
-          puts "#{ Time.new } read #{ path } #{ e.class }"
-          close_tund( tund )
-          return
-        end
-
-        caches = []
-
-        until data.empty?
-          _dst_local_port, _pack_id, pack_size = data[ 0, 12 ].unpack( 'nQ>n' )
-          caches << [ _dst_local_port, _pack_id, data[ 12, pack_size ] ]
-          data = data[ ( 12 + pack_size )..-1 ]
-        end
-
-        datas = @tund_info[ :caches ] = caches
-      elsif @tund_info[ :wbuffs ].any?
-        datas = @tund_info[ :wbuffs ]
-      else
-        @writes.delete( tund )
-        return
-      end
-
-      while datas.any?
-        dst_local_port, pack_id, data = datas.first
-        dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-
-        if dst_ext
-          if pack_id <= CONFUSE_UNTIL
-            data = @custom.encode( data )
-            # puts "debug1 encoded pack #{ pack_id }"
-          end
-
-          data = [ [ pack_id, dst_local_port ].pack( 'Q>n' ), data ].join
-
-          unless send_data( tund, data, @tund_info[ :tun_addr ] )
-            return
-          end
-
-          # puts "debug2 written pack #{ pack_id }"
-          dst_ext[ :relay_pack_id ] = pack_id
-          dst_ext[ :wmems ][ pack_id ] = data
-          dst_ext[ :send_ats ][ pack_id ] = now
-          dst_ext[ :last_continue_at ] = now
-        end
-
-        datas.shift
-      end
-    end
-
-    ##
-    # read dotr
-    #
-    def read_dotr( dotr )
-      dotr.read( 1 )
-    end
-
-    ##
-    # read dst
-    #
-    def read_dst( dst )
-      begin
-        data = dst.read_nonblock( PACK_SIZE )
-      rescue IO::WaitReadable, Errno::EINTR
-        return
-      rescue Exception => e
-        # puts "debug1 read dst #{ e.class }"
-        set_is_closing( dst )
-        return
-      end
-
-      # puts "debug2 read dst #{ data.inspect }"
-      dst_info = @dst_infos[ dst ]
-      dst_info[ :last_continue_at ] = Time.new
-
-      if @tund.closed?
-        puts "#{ Time.new } tund closed, close dst"
-        set_is_closing( dst )
-        return
-      end
-
-      pack_id = dst_info[ :biggest_pack_id ] + 1
-      dst_info[ :biggest_pack_id ] = pack_id
-      add_tund_wbuff( dst_info[ :local_port ], pack_id, data )
-    end
-
-    ##
-    # read tund
-    #
-    def read_tund( tund )
-      data, addrinfo, rflags, *controls = tund.recvmsg
-      now = Time.new
-      pack_id = data[ 0, 8 ].unpack( 'Q>' ).first
-
-      if pack_id == 0
-        ctl_num = data[ 8 ].unpack( 'C' ).first
-
-        case ctl_num
-        when PEER_ADDR
-          return if @tund_info[ :peer_addr ] || ( addrinfo.to_sockaddr != @p2pd_addr )
-
-          peer_addr = data[ 9..-1 ]
-          puts "#{ Time.new } got peer addr #{ Addrinfo.new( peer_addr ).inspect }"
-
-          @tund_info[ :peer_addr ] = peer_addr
-          @tund_info[ :peer_at ] = now
-          loop_punch_peer
-        when HEARTBEAT
-          from_addr = addrinfo.to_sockaddr
-          return if from_addr != @tund_info[ :peer_addr ]
-
-          # puts "debug1 set tun addr #{ Addrinfo.new( from_addr ).inspect }"
-          @tund_info[ :tun_addr ] = from_addr
-          @tund_info[ :last_recv_at ] = now
-        when A_NEW_SOURCE
-          return unless is_match_tun_addr( addrinfo )
-
-          src_id = data[ 9, 8 ].unpack( 'Q>' ).first
-          dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
-          # puts "debug1 got a new source #{ src_id }"
-
-          if dst_local_port
-            dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-            return unless dst_ext
-
-            if dst_ext[ :dst ].closed?
-              dst_local_port = 0
-            end
-          else
-            dst = Socket.new( Socket::AF_INET, Socket::SOCK_STREAM, 0 )
-
-            if RUBY_PLATFORM.include?( 'linux' )
-              dst.setsockopt( Socket::SOL_TCP, Socket::TCP_NODELAY, 1 )
-            end
-
-            begin
-              dst.connect_nonblock( @appd_addr )
-            rescue IO::WaitWritable
-            rescue Exception => e
-              puts "#{ Time.new } connect appd #{ e.class }"
-              return
-            end
-
-            dst_local_port = dst.local_address.ip_port
-
-            @dst_infos[ dst ] = {
-              local_port: dst_local_port, # 本地端口
-              biggest_pack_id: 0,         # 最大包号码
-              wbuff: '',                  # 写前
-              cache: '',                  # 块读出缓存
-              chunks: [],                 # 块队列，写前达到块大小时结一个块 filename
-              spring: 0,                  # 块后缀，结块时，如果块队列不为空，则自增，为空，则置为0
-              last_continue_at: Time.new, # 上一次发生流量的时间
-              is_closing: false           # 是否准备关闭
-            }
-            add_read( dst, :dst )
-
-            @tund_info[ :dst_local_ports ][ src_id ] = dst_local_port
-            @tund_info[ :dst_exts ][ dst_local_port ] = {
-              dst: dst,                  # dst
-              src_id: src_id,            # 近端src id
-              wmems: {},                 # 写后 pack_id => data
-              send_ats: {},              # 上一次发出时间 pack_id => send_at
-              relay_pack_id: 0,          # 转发到几
-              continue_src_pack_id: 0,   # 收到几
-              pieces: {},                # 跳号包 src_pack_id => data
-              is_src_closed: false,      # src是否已关闭
-              biggest_src_pack_id: 0,    # src最大包号码
-              completed_pack_id: 0,      # 完成到几（对面收到几）
-              last_continue_at: Time.new # 上一次发生流量的时间
-            }
-          end
-
-          data2 = [ 0, PAIRED, src_id, dst_local_port ].pack( 'Q>CQ>n' )
-          # puts "debug1 add ctlmsg paired #{ data2.inspect }"
-          add_tund_ctlmsg( data2 )
-        when SOURCE_STATUS
-          return unless is_match_tun_addr( addrinfo )
-
-          src_id, relay_src_pack_id, continue_dst_pack_id  = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
-
-          dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
-          return unless dst_local_port
-
-          dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-          return unless dst_ext
-
-          # puts "debug2 got source status"
-
-          release_wmems( dst_ext, continue_dst_pack_id )
-
-          # 发miss
-          if !dst_ext[ :dst ].closed? && ( dst_ext[ :continue_src_pack_id ] < relay_src_pack_id )
-            ranges = []
-            curr_pack_id = dst_ext[ :continue_src_pack_id ] + 1
-
-            dst_ext[ :pieces ].keys.sort.each do | pack_id |
-              if pack_id > curr_pack_id
-                ranges << [ curr_pack_id, pack_id - 1 ]
-              end
-
-              curr_pack_id = pack_id + 1
-            end
-
-            if curr_pack_id <= relay_src_pack_id
-              ranges << [ curr_pack_id, relay_src_pack_id ]
-            end
-
-            pack_count = 0
-            # puts "debug1 continue/relay #{ dst_ext[ :continue_src_pack_id ] }/#{ relay_src_pack_id } send MISS #{ ranges.size }"
-
-            ranges.each do | pack_id_begin, pack_id_end |
-              if pack_count >= BREAK_SEND_MISS
-                puts "#{ Time.new } break send miss at #{ pack_id_begin }"
-                break
-              end
-
-              data2 = [ 0, MISS, src_id, pack_id_begin, pack_id_end ].pack( 'Q>CQ>Q>Q>' )
-              add_tund_ctlmsg( data2 )
-              pack_count += ( pack_id_end - pack_id_begin + 1 )
-            end
-          end
-        when MISS
-          return unless is_match_tun_addr( addrinfo )
-
-          dst_local_port, pack_id_begin, pack_id_end = data[ 9, 18 ].unpack( 'nQ>Q>' )
-
-          dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-          return unless dst_ext
-
-          ( pack_id_begin..pack_id_end ).each do | pack_id |
-            send_at = dst_ext[ :send_ats ][ pack_id ]
-
-            if send_at
-              break if now - send_at < STATUS_INTERVAL
-              @tund_info[ :resendings ] << [ dst_local_port, pack_id ]
-            end
-          end
-
-          add_write( tund )
-        when FIN1
-          return unless is_match_tun_addr( addrinfo )
-
-          src_id, biggest_src_pack_id, continue_dst_pack_id = data[ 9, 24 ].unpack( 'Q>Q>Q>' )
-
-          dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
-          return unless dst_local_port
-
-          dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-          return unless dst_ext
-
-          # puts "debug1 got fin1 #{ src_id } biggest src pack #{ biggest_src_pack_id } completed dst pack #{ continue_dst_pack_id }"
-          dst_ext[ :is_src_closed ] = true
-          dst_ext[ :biggest_src_pack_id ] = biggest_src_pack_id
-          release_wmems( dst_ext, continue_dst_pack_id )
-
-          if biggest_src_pack_id == dst_ext[ :continue_src_pack_id ]
-            # puts "debug1 4-1. tund recv fin1 -> all traffic received ? -> close dst after write"
-            set_is_closing( dst_ext[ :dst ] )
-          end
-        when FIN2
-          return unless is_match_tun_addr( addrinfo )
-
-          src_id = data[ 9, 8 ].unpack( 'Q>' ).first
-
-          dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
-          return unless dst_local_port
-
-          # puts "debug1 3-2. tund recv fin2 -> del dst ext"
-          del_dst_ext( dst_local_port )
-        when TUN_FIN
-          return unless is_match_tun_addr( addrinfo )
-
-          puts "#{ Time.new } recv tun fin"
-          set_is_closing( tund )
-        end
-
-        return
-      end
-
-      return unless is_match_tun_addr( addrinfo )
-
-      src_id = data[ 8, 8 ].unpack( 'Q>' ).first
-
-      dst_local_port = @tund_info[ :dst_local_ports ][ src_id ]
-      return unless dst_local_port
-
-      dst_ext = @tund_info[ :dst_exts ][ dst_local_port ]
-      return if dst_ext.nil? || dst_ext[ :dst ].closed?
-      return if ( pack_id <= dst_ext[ :continue_src_pack_id ] ) || dst_ext[ :pieces ].include?( pack_id )
-
-      data = data[ 16..-1 ]
-      # puts "debug2 got pack #{ pack_id }"
-
-      if pack_id <= CONFUSE_UNTIL
-        # puts "debug2 #{ data.inspect }"
-        data = @custom.decode( data )
-        # puts "debug1 decoded pack #{ pack_id }"
-      end
-
-      # 放进写前，跳号放碎片缓存
-      if pack_id - dst_ext[ :continue_src_pack_id ] == 1
-        while dst_ext[ :pieces ].include?( pack_id + 1 )
-          data << dst_ext[ :pieces ].delete( pack_id + 1 )
-          pack_id += 1
-        end
-
-        dst_ext[ :continue_src_pack_id ] = pack_id
-        dst_ext[ :last_continue_at ] = now
-        add_dst_wbuff( dst_ext[ :dst ], data )
-        # puts "debug2 update continue src pack #{ pack_id }"
-
-        # 接到流量，若对面已关闭，且流量正好收全，关闭dst
-        if dst_ext[ :is_src_closed ] && ( pack_id == dst_ext[ :biggest_src_pack_id ] )
-          # puts "debug1 4-2. tund recv traffic -> src closed and all traffic received ? -> close dst after write"
-          set_is_closing( dst_ext[ :dst ] )
-          return
-        end
-      else
-        dst_ext[ :pieces ][ pack_id ] = data
-      end
-    end
-
   end
 end

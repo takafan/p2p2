@@ -1,113 +1,65 @@
 require 'json'
 require 'p2p2/head'
-require 'p2p2/p2_custom'
 require 'p2p2/p2_worker'
 require 'p2p2/version'
 require 'socket'
 
 ##
-# P2p2::P2 - p2p通道，p2端。
+# P2p2::P2 - p2端
+#
+# send title Exception:               close ctl, close src
+# read shadow:                        renew src, close tun, renew ctl
+# read src Exception:                 close read src, set tun closing write
+# read ctl peer addr:                 renew tun
+# read tun ECONNREFUSED out of limit: close tun, close src
+# read tun ECONNREFUSED:              renew tun
+# read tun other Exception:           close read tun, set src closing write
+# write tun Exception:                close write tun, close read src
+# write src Exception:                close write src, close read tun
 #
 module P2p2
   class P2
 
     def initialize( config_path = nil )
-      unless config_path
+      unless config_path then
         config_path = File.expand_path( '../p2p2.conf.json', __FILE__ )
       end
 
-      unless File.exist?( config_path )
-        raise "missing config file #{ config_path }"
-      end
+      raise "missing config file #{ config_path }" unless File.exist?( config_path )
 
       conf = JSON.parse( IO.binread( config_path ), symbolize_names: true )
-      p2pd_host = conf[ :p2pd_host ]
-      p2pd_port = conf[ :p2pd_port ]
+      paird_host = conf[ :paird_host ]
+      paird_port = conf[ :paird_port ]
       room = conf[ :room ]
-      sdwd_host = conf[ :sdwd_host ]
-      sdwd_port = conf[ :sdwd_port ]
-      p2_tmp_dir = conf[ :p2_tmp_dir ]
+      shadow_host = conf[ :shadow_host ]
+      shadow_port = conf[ :shadow_port ]
 
-      unless p2pd_host
-        raise "missing p2pd host"
+      raise 'missing paird host' unless paird_host
+      raise 'missing room' unless room
+
+      unless paird_port then
+        paird_port = 4040
       end
 
-      unless room
-        raise "missing room"
+      unless shadow_host then
+        shadow_host = '0.0.0.0'
       end
 
-      unless p2pd_port
-        p2pd_port = 2020
+      unless shadow_port then
+        shadow_port = 4444
       end
 
-      unless sdwd_host
-        sdwd_host = '0.0.0.0'
+      puts "p2p2 p2 #{ P2p2::VERSION }"
+      puts "paird #{ paird_host } #{ paird_port } room #{ room } shadow #{ shadow_host } #{ shadow_port }"
+
+      worker = P2p2::P2Worker.new( paird_host, paird_port, room, shadow_host, shadow_port )
+
+      Signal.trap( :TERM ) do
+        puts 'exit'
+        worker.quit!
       end
 
-      unless sdwd_port
-        sdwd_port = 2222
-      end
-
-      unless p2_tmp_dir
-        p2_tmp_dir = '/tmp/p2p2.p2'
-      end
-
-      unless File.exist?( p2_tmp_dir )
-        Dir.mkdir( p2_tmp_dir )
-      end
-
-      src_chunk_dir = File.join( p2_tmp_dir, 'src.chunk' )
-
-      unless Dir.exist?( src_chunk_dir )
-        Dir.mkdir( src_chunk_dir )
-      end
-
-      tun_chunk_dir = File.join( p2_tmp_dir, 'tun.chunk' )
-
-      unless Dir.exist?( tun_chunk_dir )
-        Dir.mkdir( tun_chunk_dir )
-      end
-
-      title = "p2p2 p2 #{ P2p2::VERSION }"
-      puts title
-      puts "p2pd host #{ p2pd_host }"
-      puts "p2pd port #{ p2pd_port }"
-      puts "room #{ room }"
-      puts "sdwd host #{ sdwd_host }"
-      puts "sdwd port #{ sdwd_port }"
-      puts "p2 tmp dir #{ p2_tmp_dir }"
-      puts "src chunk dir #{ src_chunk_dir }"
-      puts "tun chunk dir #{ tun_chunk_dir }"
-
-      if RUBY_PLATFORM.include?( 'linux' )
-        $0 = title
-
-        pid = fork do
-          $0 = 'p2p2 p2 worker'
-          worker = P2p2::P2Worker.new( p2pd_host, p2pd_port, room, sdwd_host, sdwd_port, src_chunk_dir, tun_chunk_dir )
-
-          Signal.trap( :TERM ) do
-            puts 'exit'
-            worker.quit!
-          end
-
-          worker.looping
-        end
-
-        Signal.trap( :TERM ) do
-          puts 'trap TERM'
-
-          begin
-            Process.kill( :TERM, pid )
-          rescue Errno::ESRCH => e
-            puts e.class
-          end
-        end
-
-        Process.waitall
-      else
-        P2p2::P2Worker.new( p2pd_host, p2pd_port, room, sdwd_host, sdwd_port, src_chunk_dir, tun_chunk_dir ).looping
-      end
+      worker.looping
     end
 
   end

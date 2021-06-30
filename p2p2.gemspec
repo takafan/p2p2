@@ -10,23 +10,20 @@ Gem::Specification.new do |spec|
   spec.email         = ["qqtakafan@gmail.com"]
 
   spec.summary       = %q{p2p}
-  spec.description   = %q{p2p通道。nat穿透。}
+  spec.description   = %q{p2p连回家。}
   spec.homepage      = "https://github.com/takafan/p2p2"
   spec.license       = "MIT"
 
   spec.files         = %w[
 p2p2.gemspec
 lib/p2p2.rb
-lib/p2p2/custom.rb
 lib/p2p2/head.rb
-lib/p2p2/p1_custom.rb
 lib/p2p2/p1_worker.rb
 lib/p2p2/p1.rb
-lib/p2p2/p2_custom.rb
 lib/p2p2/p2_worker.rb
 lib/p2p2/p2.rb
-lib/p2p2/p2pd_worker.rb
-lib/p2p2/p2pd.rb
+lib/p2p2/paird_worker.rb
+lib/p2p2/paird.rb
 lib/p2p2/version.rb
   ]
 
