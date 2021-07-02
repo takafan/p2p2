@@ -17,6 +17,7 @@ Gem::Specification.new do |spec|
   spec.files         = %w[
 p2p2.gemspec
 lib/p2p2.rb
+lib/p2p2/concurrent_hash.rb
 lib/p2p2/head.rb
 lib/p2p2/p1_worker.rb
 lib/p2p2/p1.rb

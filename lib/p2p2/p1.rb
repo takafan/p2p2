@@ -1,4 +1,5 @@
 require 'json'
+require 'p2p2/concurrent_hash'
 require 'p2p2/head'
 require 'p2p2/p1_worker'
 require 'p2p2/version'
@@ -6,17 +7,6 @@ require 'socket'
 
 ##
 # P2p2::P1 - p1端
-#
-# send title Exception:               renew ctl
-# loop send title:                    renew ctl if tun closed
-# read ctl peer addr:                 renew tun, renew dst
-# read tun ECONNREFUSED out of limit: close tun, close dst, renew ctl
-# read tun ECONNREFUSED:              renew tun
-# read tun other Exception:           close read tun, set dst closing write, renew paired ctl
-# read dst Exception:                 close read dst, set tun closing write, renew paired ctl
-# write tun:                          renew ctl if once connected
-# write tun Exception:                close write tun, close read dst, renew paired ctl
-# write dst Exception:                close write dst, close read tun, renew paired ctl
 #
 module P2p2
   class P1

@@ -1,4 +1,5 @@
 require 'json'
+require 'p2p2/concurrent_hash'
 require 'p2p2/head'
 require 'p2p2/p2_worker'
 require 'p2p2/version'
@@ -6,16 +7,6 @@ require 'socket'
 
 ##
 # P2p2::P2 - p2端
-#
-# send title Exception:               close ctl, close src
-# read shadow:                        renew src, close tun, renew ctl
-# read src Exception:                 close read src, set tun closing write
-# read ctl peer addr:                 renew tun
-# read tun ECONNREFUSED out of limit: close tun, close src
-# read tun ECONNREFUSED:              renew tun
-# read tun other Exception:           close read tun, set src closing write
-# write tun Exception:                close write tun, close read src
-# write src Exception:                close write src, close read tun
 #
 module P2p2
   class P2
