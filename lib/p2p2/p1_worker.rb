@@ -349,7 +349,7 @@ module P2p2
 
       add_read( ctl, :ctl )
 
-      puts "#{ Time.new } hello i'm #{ @title.inspect } #{ Addrinfo.new( @ctl_info[ :paird_addr ] ).inspect }"
+      puts "#{ Time.new } #{ @title.inspect } #{ Addrinfo.new( @ctl_info[ :paird_addr ] ).inspect }"
       send_title
     end
 
@@ -446,7 +446,6 @@ module P2p2
     # renew ctl
     #
     def renew_ctl
-      puts "#{ Time.new } renew ctl"
       close_ctl
       new_a_ctl
     end
